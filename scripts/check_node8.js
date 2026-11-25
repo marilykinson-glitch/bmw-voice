@@ -14,6 +14,7 @@ const FILES = [
     'tools/bmw-voice/car-control.js',
     'tools/bmw-voice/nlu-brain.js',
     'tools/bmw-voice/mic-capture.js',
+    'tools/bmw-voice/ipa-overlay.js',
     'tools/bmw-voice/uplink.js',
 ];
 

@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-alsa-smartx.py - One-shot non-blocking SmartXbar ceiling microphone recorder for `bmw-voice`.
+alsa-smartx.py - SmartXbar Ceiling Microphone Recorder & Zero-Spawn "Hey BMW" Stream Engine (`bmw-voice`).
 
-Features:
-  - Strictly read-only (`SND_PCM_STREAM_CAPTURE`), zero background loops, zero playback handles.
-  - Dynamic End-of-Speech endpointing: stops automatically ~0.50s after the speaker finishes talking
-    (instead of waiting out a fixed 4s timer), downsamples 24 kHz -> 16 kHz, and normalizes speech gain.
+Modes:
+  1. One-shot fallback clip capture:
+       alsa-smartx.py <device> <out.wav> [duration_sec] [rate] [hw_channels]
+  2. Persistent low-CPU (<0.2%) stream daemon (`--stream-daemon`):
+       alsa-smartx.py --stream-daemon <device> <work_dir> [rate] [hw_channels]
+     - Keeps a 800ms RAM pre-roll buffer so "Hey BMW" is never clipped and Steering Wheel PTT starts in <1ms
+       (zero Python/ALSA spawn delay!).
+     - Uses Amplifier Reference channel (`ch 2` on `2MIC_6REF` / `1MIC_6REF`) + syllabic SNR gate to reject
+       steady CarPlay music bleed, road hum, and short cabin clicks before waking NLU.
+     - Automatically exits if parent `stdin` closes (zero orphan processes).
 """
 import array
+import collections
 import ctypes
 import json
 import math
 import os
 import signal
 import sys
+import threading
 import time
 import wave
 
@@ -33,6 +41,14 @@ def _handle_sig(_signum, _frame):
 
 signal.signal(signal.SIGTERM, _handle_sig)
 signal.signal(signal.SIGINT, _handle_sig)
+
+
+def _emit_json(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except OSError:
+        pass
 
 
 def _load_asound():
@@ -91,16 +107,29 @@ def _open_alsa_capture(asound, device, hw_rate, hw_ch):
     return pcm
 
 
-def _extract_pcm_chunk(raw, got, hw_ch, out_channels):
+def _extract_pcm_and_ref_db(raw, got, hw_ch, out_channels):
+    """Extract 1/2 mic channels + compute speaker reference channel dB (if hw_ch >= 3)."""
+    ref_db = -90.0
+    if hw_ch >= 3 and got >= 16:
+        all_s = array.array("h")
+        all_s.frombytes(raw)
+        if sys.byteorder != "little":
+            all_s.byteswap()
+        # Channel index 2 is ReferenceInput1 (Harman / B&W speaker loopback)
+        ref_sub = all_s[2 :: hw_ch * 4]
+        if ref_sub:
+            ref_rms = math.sqrt(sum(x * x for x in ref_sub) / len(ref_sub)) / 32768.0
+            ref_db = round(20.0 * math.log10(ref_rms), 1) if ref_rms > 1e-5 else -90.0
+
     if hw_ch == out_channels:
-        return raw
+        return raw, ref_db
     bytes_per_frame = hw_ch * 2
     sample_bytes = 4 if out_channels == 2 else 2
     out = bytearray()
     for f in range(got):
         off = f * bytes_per_frame
         out.extend(raw[off : off + sample_bytes])
-    return bytes(out)
+    return bytes(out), ref_db
 
 
 def _fast_chunk_db_and_peak(pcm_bytes, channels=1):
@@ -234,7 +263,7 @@ def record_smartx_wav(device, out_wav, duration_sec=4.2, rate=24000, hw_channels
     pcm = _open_alsa_capture(asound, device, hw_rate, hw_ch)
     try:
         total_hw_frames = max(2400, int(max_dur * hw_rate))
-        chunk_frames = max(480, int(hw_rate * 0.05))  # 50ms chunks for crisp 0.50s end-of-speech stop
+        chunk_frames = max(480, int(hw_rate * 0.05))
         bytes_per_frame = hw_ch * 2
         buf = ctypes.create_string_buffer(chunk_frames * bytes_per_frame)
 
@@ -273,7 +302,7 @@ def record_smartx_wav(device, out_wav, duration_sec=4.2, rate=24000, hw_channels
                 continue
 
             raw = buf.raw[: got * bytes_per_frame]
-            chunk_out = _extract_pcm_chunk(raw, got, hw_ch, out_channels)
+            chunk_out, _ = _extract_pcm_and_ref_db(raw, got, hw_ch, out_channels)
             if not saw_nonzero:
                 if any(b != 0 for b in chunk_out):
                     saw_nonzero = True
@@ -298,49 +327,320 @@ def record_smartx_wav(device, out_wav, duration_sec=4.2, rate=24000, hw_channels
                         post_quiet_chunks = 0
                     else:
                         if voiced_chunks < 4 and db > -85.0:
-                            floor_db = max(-65.0, min(-26.0, floor_db * 0.90 + db * 0.10))
+                            floor_db = max(-65.0, min(-26.0, floor_db * 0.88 + db * 0.12))
                         if voiced_chunks >= 5:
                             post_quiet_chunks += 1
                             if post_quiet_chunks >= 10 and frames_read >= int(hw_rate * 0.85):
                                 break
-                        elif frames_read >= int(hw_rate * 2.1) and voiced_chunks < 2:
-                            break
+
+        if not saw_nonzero or len(collected) < 1600:
+            raise RuntimeError(f"silent/empty capture on {device}")
+
+        boosted_bytes, final_ch, final_rate, final_peak, snr_db = _condition_and_boost_pcm(
+            bytes(collected), out_channels, hw_rate
+        )
+        _write_wav_atomic(out_wav, final_ch, final_rate, boosted_bytes)
+        return {
+            "ok": True,
+            "device": device,
+            "frames": frames_read,
+            "outChannels": final_ch,
+            "sampleRate": final_rate,
+            "peak": final_peak,
+            "snrDb": snr_db,
+        }
     finally:
         asound.snd_pcm_close(pcm)
 
-    out_frames = len(collected) // (out_channels * 2)
-    if out_frames < max(800, hw_rate // 5):
-        raise RuntimeError(f"insufficient frames ({out_frames}) from {device}")
 
-    final_pcm, final_ch, final_rate, peak, snr_db = _condition_and_boost_pcm(bytes(collected), out_channels, hw_rate)
-    if peak == 0:
-        raise RuntimeError(f"zero peak on {device}")
-
-    _write_wav_atomic(out_wav, final_ch, final_rate, final_pcm)
-    return {
-        "ok": True,
-        "device": device,
-        "frames": len(final_pcm) // (final_ch * 2),
-        "rate": final_rate,
-        "channels": final_ch,
-        "peak": peak,
-        "snrDb": snr_db,
-        "bytes": len(final_pcm),
-    }
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.stderr.write("usage: alsa-smartx.py <device> <out.wav> [duration_sec] [rate] [hw_channels]\n")
-        sys.exit(2)
-    dev = sys.argv[1]
-    out_file = sys.argv[2]
-    dur = float(sys.argv[3]) if len(sys.argv) > 3 else 4.2
-    sr = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
-    ch = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
+    global STOP_FLAG
     try:
-        res = record_smartx_wav(dev, out_file, dur, sr, ch)
+        os.nice(8)
+    except OSError:
+        pass
+    os.makedirs(work_dir, exist_ok=True)
+    cmd_queue = collections.deque()
+
+    def _stdin_reader():
+        global STOP_FLAG
+        while not STOP_FLAG:
+            try:
+                line = sys.stdin.readline()
+            except BaseException:
+                line = ""
+            if not line:
+                STOP_FLAG = True
+                break
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                cmd_queue.append(json.loads(s))
+            except ValueError:
+                pass
+
+    reader = threading.Thread(target=_stdin_reader, daemon=True)
+    reader.start()
+
+    asound = _load_asound()
+    hw_rate = int(rate)
+    hw_ch = max(1, int(hw_channels))
+    out_channels = 2 if hw_ch >= 2 else 1
+
+    pcm = _open_alsa_capture(asound, device, hw_rate, hw_ch)
+    try:
+        chunk_frames = max(480, int(hw_rate * 0.05))  # 50ms chunks
+        bytes_per_frame = hw_ch * 2
+        buf = ctypes.create_string_buffer(chunk_frames * bytes_per_frame)
+
+        preroll = collections.deque(maxlen=16)  # 800ms pre-roll
+        saw_nonzero = False
+        zero_frames = 0
+        max_zero_frames = int(hw_rate * 0.60)
+        first_frame_deadline = time.monotonic() + 1.10
+        ready_sent = False
+
+        floor_db = -46.0
+        echo_offset_db = -8.0  # typical ceiling mic attenuation vs speaker reference
+        calib_count = 0
+
+        # Mode: "wake" | "ptt"
+        mode = "wake"
+        ptt_buf = bytearray()
+        ptt_frames = 0
+        ptt_max_frames = int(hw_rate * 4.2)
+        ptt_voiced = 0
+        ptt_quiet = 0
+        ptt_req_id = 0
+        last_level_emit = 0.0
+
+        wake_active = False
+        wake_buf = bytearray()
+        wake_frames = 0
+        wake_voiced = 0
+        wake_quiet = 0
+        wake_hint_sent = False
+        last_hint_at = 0.0
+        wake_cooldown_until = 0.0
+
+        while not STOP_FLAG:
+            # 1. Process instant commands from Node (<1ms PTT switch!)
+            while cmd_queue:
+                c = cmd_queue.popleft()
+                cname = c.get("cmd")
+                if cname == "stop":
+                    STOP_FLAG = True
+                    break
+                if cname == "ptt":
+                    mode = "ptt"
+                    wake_active = False
+                    wake_buf.clear()
+                    ptt_buf = bytearray()
+                    if not c.get("noPreroll"):
+                        recent = list(preroll)[-4:]  # 200ms pre-roll so 1st syllable is crisp
+                        for ch_bytes in recent:
+                            ptt_buf.extend(ch_bytes)
+                    ptt_frames = 0
+                    max_sec = max(1.8, min(6.5, float(c.get("maxSec", 4.2))))
+                    ptt_max_frames = int(hw_rate * max_sec)
+                    ptt_voiced = 0
+                    ptt_quiet = 0
+                    ptt_req_id = int(c.get("reqId", 0))
+                    _emit_json({"event": "ptt_started", "reqId": ptt_req_id})
+                elif cname == "ptt_stop" and mode == "ptt":
+                    ptt_max_frames = ptt_frames  # finish immediately on next chunk
+                elif cname == "cooldown":
+                    ms = float(c.get("ms", 800))
+                    wake_cooldown_until = time.monotonic() + (ms / 1000.0)
+                    wake_active = False
+                    wake_buf.clear()
+
+            if STOP_FLAG:
+                break
+
+            now = time.monotonic()
+            if not ready_sent and now > first_frame_deadline:
+                raise RuntimeError(f"no audio frames within 1.1s on {device}")
+
+            got = asound.snd_pcm_readi(pcm, buf, chunk_frames)
+            if got == EAGAIN or got == 0:
+                time.sleep(0.010)
+                continue
+            if got < 0:
+                rec = asound.snd_pcm_recover(pcm, int(got), 1)
+                if rec < 0:
+                    err = asound.snd_strerror(int(got)).decode("utf-8", "replace")
+                    raise RuntimeError(f"snd_pcm_readi({device}): {err} ({got})")
+                asound.snd_pcm_start(pcm)
+                time.sleep(0.010)
+                continue
+
+            raw = buf.raw[: got * bytes_per_frame]
+            chunk_out, ref_db = _extract_pcm_and_ref_db(raw, got, hw_ch, out_channels)
+            if not saw_nonzero:
+                if any(b != 0 for b in chunk_out):
+                    saw_nonzero = True
+                else:
+                    zero_frames += got
+                    if zero_frames >= max_zero_frames:
+                        raise RuntimeError(f"digital zero stream on {device}")
+                    continue
+
+            if not ready_sent:
+                ready_sent = True
+                _emit_json({"event": "ready", "device": device})
+
+            db, pk = _fast_chunk_db_and_peak(chunk_out, out_channels)
+
+            # 2. Active PTT / 2-step follow-up recording
+            if mode == "ptt":
+                ptt_buf.extend(chunk_out)
+                ptt_frames += got
+                if (now - last_level_emit) >= 0.14:
+                    last_level_emit = now
+                    _emit_json({"event": "mic_level", "db": db})
+
+                is_voiced = (db >= max(-47.0, floor_db + 5.8)) and (pk >= 115)
+                if is_voiced:
+                    ptt_voiced += 1
+                    ptt_quiet = 0
+                elif ptt_voiced >= 5:
+                    ptt_quiet += 1
+
+                done_early = ptt_voiced >= 5 and ptt_quiet >= 10 and ptt_frames >= int(hw_rate * 0.75)
+                if done_early or ptt_frames >= ptt_max_frames:
+                    out_wav = os.path.join(work_dir, "ptt_clip.wav")
+                    boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
+                        bytes(ptt_buf), out_channels, hw_rate
+                    )
+                    _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
+                    dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
+                    _emit_json({
+                        "event": "ptt_clip",
+                        "reqId": ptt_req_id,
+                        "file": out_wav,
+                        "durationMs": dur_ms,
+                        "peak": f_peak,
+                        "snrDb": snr_db,
+                        "device": device,
+                    })
+                    ptt_buf.clear()
+                    preroll.clear()
+                    mode = "wake"
+                    wake_cooldown_until = time.monotonic() + 0.45
+                continue
+
+            # 3. Background "Hey BMW" Wake Word Listener (`mode == "wake"`)
+            preroll.append(chunk_out)
+            if now < wake_cooldown_until:
+                continue
+
+            if calib_count < 8:
+                if db > -85.0:
+                    floor_db = db if calib_count == 0 else (floor_db * 0.75 + db * 0.25)
+                    floor_db = max(-62.0, min(-26.0, floor_db))
+                    if hw_ch >= 3 and ref_db > -45.0:
+                        echo_offset_db = max(-22.0, min(6.0, db - ref_db))
+                    calib_count += 1
+                continue
+
+            # Music reference echo check: when B&W speakers play CarPlay music (`ref_db > -38`),
+            # require mic level to rise meaningfully above speaker acoustic bleed
+            music_playing = (hw_ch >= 3) and (ref_db > -38.0)
+            expected_bleed = (ref_db + echo_offset_db) if music_playing else -90.0
+            thresh_db = max(-45.5, floor_db + 6.5, expected_bleed + 5.0)
+            is_voiced = (db >= thresh_db) and (pk >= 135)
+
+            if not wake_active:
+                if is_voiced:
+                    wake_active = True
+                    wake_buf = bytearray()
+                    for ch_bytes in preroll:
+                        wake_buf.extend(ch_bytes)
+                    wake_frames = got
+                    wake_voiced = 1
+                    wake_quiet = 0
+                    wake_hint_sent = False
+                else:
+                    if db > -85.0:
+                        floor_db = max(-62.0, min(-26.0, floor_db * 0.94 + db * 0.06))
+                    if music_playing and db > -75.0:
+                        echo_offset_db = max(-22.0, min(6.0, echo_offset_db * 0.95 + (db - ref_db) * 0.05))
+            else:
+                wake_buf.extend(chunk_out)
+                wake_frames += got
+                if is_voiced:
+                    wake_voiced += 1
+                    wake_quiet = 0
+                    if not wake_hint_sent and wake_voiced >= 4 and (now - last_hint_at) > 3.5:
+                        wake_hint_sent = True
+                        last_hint_at = now
+                        _emit_json({"event": "speech_hint"})
+                else:
+                    wake_quiet += 1
+
+                # Continuous talk > 6.5s without pause is radio/passenger conversation -> reset quietly
+                if wake_frames > int(hw_rate * 6.5):
+                    wake_active = False
+                    wake_buf.clear()
+                    preroll.clear()
+                    continue
+
+                if wake_quiet >= 10:  # 0.50s end-of-speech pause
+                    # "Hey BMW" has >= 3 syllables (>= 450ms = 9 chunks). Short coughs/clicks (<9 chunks) drop locally!
+                    if wake_voiced >= 9:
+                        boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
+                            bytes(wake_buf), out_channels, hw_rate
+                        )
+                        if snr_db >= 4.4 and f_peak >= 900:
+                            out_wav = os.path.join(work_dir, "wake_clip.wav")
+                            _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
+                            dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
+                            _emit_json({
+                                "event": "wake_clip",
+                                "file": out_wav,
+                                "durationMs": dur_ms,
+                                "peak": f_peak,
+                                "snrDb": snr_db,
+                                "device": device,
+                            })
+                    wake_active = False
+                    wake_buf.clear()
+    finally:
+        asound.snd_pcm_close(pcm)
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--stream-daemon":
+        dev = sys.argv[2]
+        wdir = sys.argv[3]
+        rt = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
+        ch = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+        try:
+            run_stream_daemon(dev, wdir, rt, ch)
+        except Exception as exc:
+            _emit_json({"event": "error", "error": str(exc)})
+            sys.exit(2)
+        return
+
+    if len(sys.argv) < 3:
+        sys.stderr.write("Usage: alsa-smartx.py <device> <out.wav> [duration_sec] [rate] [hw_channels]\n")
+        sys.exit(2)
+
+    dev = sys.argv[1]
+    out = sys.argv[2]
+    dur = float(sys.argv[3]) if len(sys.argv) > 3 else 4.2
+    rt = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
+    ch = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+
+    try:
+        res = record_smartx_wav(dev, out, dur, rt, ch)
         sys.stdout.write(json.dumps(res) + "\n")
     except Exception as exc:
         sys.stderr.write(str(exc) + "\n")
-        sys.exit(1)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

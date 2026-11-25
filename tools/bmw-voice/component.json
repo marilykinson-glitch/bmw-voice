@@ -1,9 +1,9 @@
 {
   "id": "bmw-voice",
   "kind": "tool",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "title": "Trợ lý Giọng nói BMW (Tiếng Việt)",
-  "description": "Trợ lý giọng nói Tiếng Việt tối giản theo đúng chuẩn BMW Intelligent Personal Assistant trên MGU iDrive 7 (SP18): bấm nút Mic vô-lăng để điều khiển điều hoà, sưởi/làm mát ghế, đèn viền nội thất, âm lượng/chuyển bài nhạc, cửa kính và xem thông số xe — thực thi tức thì, không ngắt nhạc CarPlay.",
+  "description": "Thay thế Trợ lý Giọng nói nguyên bản BMW Intelligent Personal Assistant trên MGU iDrive 7 (SP18): hỗ trợ gọi rảnh tay \"Hey BMW\" và bấm nút Mic vô-lăng hiện ngay giao diện trợ lý chuẩn BMW đè trên mọi màn hình (kể cả CarPlay), điều khiển điều hoà, ghế, đèn viền, âm lượng/nhạc, cửa kính và thông số xe bằng Tiếng Việt.",
   "license": "GPL-3.0-or-later",
   "mguHmi": [
     "ID7"
@@ -31,6 +31,10 @@
       "mode": "0644"
     },
     {
+      "path": "ipa-overlay.js",
+      "mode": "0644"
+    },
+    {
       "path": "alsa-smartx.py",
       "mode": "0755"
     },
@@ -40,6 +44,18 @@
     },
     {
       "path": "page.html",
+      "mode": "0644"
+    },
+    {
+      "path": "fonts/vietnamese.json",
+      "mode": "0644"
+    },
+    {
+      "path": "fonts/vietnamese-bold.json",
+      "mode": "0644"
+    },
+    {
+      "path": "fonts/OFL-Inter.txt",
       "mode": "0644"
     },
     {

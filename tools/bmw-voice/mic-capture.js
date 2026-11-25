@@ -1,15 +1,18 @@
 'use strict';
 /**
- * mic-capture.js - On-demand BMW MGU SmartXbar Ceiling Microphone Capture & Stereo Zone Analyzer (`bmw-voice`).
+ * mic-capture.js - BMW MGU SmartXbar Ceiling Microphone Engine (`bmw-voice`).
  *
- * Strictly on-demand (triggered ONLY by Steering Wheel PTT or Screen Mic tap):
- *   - Uses shared virtual `smartx:SpeechSink_*` / `VoiceNotesSink` pipes ONLY (zero `avb:` or `hw:` contention).
- *   - Never disconnects BMW's persistent `129 -> 387` (`SpeechSink`) AudioManager route.
- *   - Analyzes Left (Driver) vs Right (Passenger) ceiling mic RMS dBFS so zone-free commands ("tôi lạnh quá")
- *     automatically target the person who spoke.
+ * Capabilities:
+ *   1. Persistent low-CPU `MicStreamEngine` (`alsa-smartx.py --stream-daemon`):
+ *      - Listens hands-free for `"Hey BMW"` on shared `smartx:SpeechSink_*` pipes after 45s MGU boot grace.
+ *      - Handles Steering Wheel Mic (`PTT`) and 2-step follow-up in `<1ms` (zero Python/ALSA process spawn delay!).
+ *      - Automatically yields and closes ALSA during phone / CarPlay calls (`shouldPause()`).
+ *   2. One-shot `captureCeilingMic` fallback when hands-free mode is turned off or still in boot grace.
+ *   3. Stereo Left (Driver) vs Right (Passenger) RMS dBFS zone localization.
  *
  * Node 8 (ES2017) compatible.
  */
+const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
@@ -66,6 +69,10 @@ const SMARTX_PROFILES = [
 ];
 
 let lastWorkingHw = '';
+
+function unlinkSafe(f) {
+    try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (e) {}
+}
 
 function probeSmartxStack(opts) {
     const o = opts || {};
@@ -213,7 +220,7 @@ function buildStereoWav(leftSamples, rightSamples, sampleRate) {
 
 function recordOnce(pyBin, helperPath, cand, dur, outFile) {
     return new Promise((resolve, reject) => {
-        try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch (e) {}
+        unlinkSafe(outFile);
         const args = [
             helperPath,
             cand.hw,
@@ -290,10 +297,317 @@ async function captureCeilingMic(opts) {
     throw lastErr || new Error('Không thu được tín hiệu từ cặp Mic trần');
 }
 
+class MicStreamEngine {
+    constructor(opts) {
+        const isCustomPy = !!(opts && opts.mguPython && opts.mguPython !== MGU_PYTHON);
+        this.opts = Object.assign({
+            mguPython: MGU_PYTHON,
+            smartxHelper: SMARTX_HELPER,
+            smartxDir: '/run/smartx',
+            workDir: '/run/bmw-voice',
+            swapChannels: false,
+            minUptimeSec: isCustomPy ? 0 : 45,
+            connectAmRoute: null,
+            disconnectAmRoute: null,
+            shouldPause: () => false,
+            onSpeechHint: null,
+            onMicLevel: null,
+            onWakeUtterance: null,
+            onStatusChange: null,
+            onLog: () => {},
+        }, opts || {});
+
+        this.running = false;
+        this.tickInFlight = false;
+        this.child = null;
+        this.routeToken = null;
+        this.activeDevice = '';
+        this.status = 'off'; // off | paused | armed
+        this.profileIdx = 0;
+        this.consecutiveFails = 0;
+        this.cooldownUntil = 0;
+        this.watchTimer = null;
+        this.stdoutBuf = '';
+
+        this.reqSeq = 1;
+        this.pendingPtt = null;
+    }
+
+    setSwapChannels(flag) {
+        this.opts.swapChannels = !!flag;
+    }
+
+    setStatus(next) {
+        if (this.status === next) return;
+        this.status = next;
+        if (this.opts.onStatusChange) this.opts.onStatusChange(next, this.activeDevice);
+    }
+
+    holdCooldown(ms) {
+        this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + (ms || 900));
+        this._sendCmd({ cmd: 'cooldown', ms: ms || 900 });
+    }
+
+    _sendCmd(obj) {
+        if (!this.child || !this.child.stdin || this.child.stdin.destroyed) return false;
+        try {
+            return this.child.stdin.write(JSON.stringify(obj) + '\n');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    start() {
+        if (this.running) return;
+        this.running = true;
+        this.watchTimer = setInterval(() => {
+            this.tick().catch((e) => this.opts.onLog('mic stream tick warn: ' + e.message));
+        }, 1200);
+        if (this.watchTimer.unref) this.watchTimer.unref();
+        this.tick().catch(() => {});
+    }
+
+    async stop() {
+        this.running = false;
+        if (this.watchTimer) {
+            clearInterval(this.watchTimer);
+            this.watchTimer = null;
+        }
+        await this.killWorker('stopped');
+        this.setStatus('off');
+    }
+
+    async killWorker(reason) {
+        if (this.pendingPtt) {
+            const p = this.pendingPtt;
+            this.pendingPtt = null;
+            clearTimeout(p.timer);
+            p.reject(new Error(reason || 'stream closed'));
+        }
+        const c = this.child;
+        this.child = null;
+        this.stdoutBuf = '';
+        if (c) {
+            await new Promise((resolve) => {
+                let done = false;
+                const fin = () => { if (!done) { done = true; resolve(); } };
+                c.once('close', fin);
+                try {
+                    if (c.stdin && !c.stdin.destroyed) c.stdin.end(JSON.stringify({ cmd: 'stop' }) + '\n');
+                    c.kill('SIGTERM');
+                } catch (e) { fin(); }
+                setTimeout(() => { try { c.kill('SIGKILL'); } catch (e) {} fin(); }, 350);
+            });
+        }
+        const rt = this.routeToken;
+        this.routeToken = null;
+        if (rt && rt.created && rt.connId > 0 && typeof this.opts.disconnectAmRoute === 'function') {
+            try { await this.opts.disconnectAmRoute(rt.connId); } catch (e) {}
+        }
+    }
+
+    async tick() {
+        if (!this.running || this.tickInFlight) return;
+        this.tickInFlight = true;
+        try {
+            const bootSettling = this.opts.minUptimeSec > 0 && os.uptime() < this.opts.minUptimeSec;
+            const paused = bootSettling || !!this.opts.shouldPause();
+            if (paused) {
+                if (this.child) await this.killWorker('paused');
+                this.setStatus('paused');
+                return;
+            }
+            if (this.child) return;
+            if (Date.now() < this.cooldownUntil) {
+                this.setStatus('paused');
+                return;
+            }
+
+            const probe = probeSmartxStack(this.opts);
+            if (!probe.hasSmartxHelper || !probe.captureStreams.length) {
+                this.setStatus('paused');
+                return;
+            }
+
+            const cand = probe.captureStreams[this.profileIdx % probe.captureStreams.length];
+            if (cand.amRoute && typeof this.opts.connectAmRoute === 'function') {
+                try { this.routeToken = await this.opts.connectAmRoute(cand.amRoute); } catch (e) { this.routeToken = null; }
+            }
+            if (!this.running || this.opts.shouldPause()) {
+                await this.killWorker('paused');
+                this.setStatus('paused');
+                return;
+            }
+
+            this.stdoutBuf = '';
+            const child = cp.spawn(this.opts.mguPython, [
+                this.opts.smartxHelper,
+                '--stream-daemon',
+                String(cand.hw),
+                String(this.opts.workDir),
+                String(cand.rate || 24000),
+                String(cand.hwChannels || 8),
+            ], { stdio: ['pipe', 'pipe', 'ignore'] });
+
+            this.child = child;
+            this.activeDevice = cand.hw;
+
+            child.stdout.on('data', (chunk) => {
+                this.stdoutBuf += chunk.toString('utf8');
+                let idx;
+                while ((idx = this.stdoutBuf.indexOf('\n')) >= 0) {
+                    const line = this.stdoutBuf.slice(0, idx).trim();
+                    this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
+                    if (!line) continue;
+                    try {
+                        this._handleEvent(JSON.parse(line), cand);
+                    } catch (e) {}
+                }
+            });
+
+            child.on('close', (code) => {
+                if (this.child === child) {
+                    this.child = null;
+                    if (this.pendingPtt) {
+                        const p = this.pendingPtt;
+                        this.pendingPtt = null;
+                        clearTimeout(p.timer);
+                        p.reject(new Error('mic stream exited (' + code + ')'));
+                    }
+                    if (code !== 0 && this.running && !this.opts.shouldPause()) {
+                        this.profileIdx++;
+                        this.consecutiveFails++;
+                        const backoff = this.consecutiveFails >= 3 ? 20000 : (3000 * this.consecutiveFails);
+                        this.cooldownUntil = Date.now() + backoff;
+                        this.setStatus('paused');
+                    }
+                }
+            });
+
+            child.on('error', () => {
+                if (this.child === child) {
+                    this.child = null;
+                    this.profileIdx++;
+                    this.consecutiveFails++;
+                    this.cooldownUntil = Date.now() + 8000;
+                    this.setStatus('paused');
+                }
+            });
+        } finally {
+            this.tickInFlight = false;
+        }
+    }
+
+    _handleEvent(ev, cand) {
+        if (!ev || !ev.event) return;
+        if (ev.event === 'ready') {
+            lastWorkingHw = cand.hw;
+            this.consecutiveFails = 0;
+            this.setStatus('armed');
+            this.opts.onLog('Hey BMW stream armed on ' + cand.hw);
+        } else if (ev.event === 'speech_hint') {
+            if (this.opts.onSpeechHint) this.opts.onSpeechHint();
+        } else if (ev.event === 'mic_level') {
+            if (this.opts.onMicLevel) this.opts.onMicLevel(ev.db);
+        } else if (ev.event === 'ptt_clip' && this.pendingPtt) {
+            const p = this.pendingPtt;
+            this.pendingPtt = null;
+            clearTimeout(p.timer);
+            try {
+                const wavBuffer = fs.readFileSync(ev.file);
+                unlinkSafe(ev.file);
+                const analysis = analyzeWavBuffer(wavBuffer, { swapChannels: this.opts.swapChannels });
+                p.resolve({
+                    wavBuffer,
+                    analysis,
+                    deviceUsed: ev.device || cand.hw,
+                    instantStream: true,
+                });
+            } catch (e) {
+                p.reject(e);
+            }
+        } else if (ev.event === 'wake_clip' && ev.file) {
+            if (this.pendingPtt) {
+                unlinkSafe(ev.file);
+                return;
+            }
+            try {
+                const wavBuffer = fs.readFileSync(ev.file);
+                unlinkSafe(ev.file);
+                const analysis = analyzeWavBuffer(wavBuffer, { swapChannels: this.opts.swapChannels });
+                if (this.opts.onWakeUtterance) {
+                    this.opts.onWakeUtterance({
+                        wavBuffer,
+                        analysis,
+                        durationMs: ev.durationMs || analysis.durationMs,
+                        snrDb: ev.snrDb || 0,
+                        deviceUsed: ev.device || cand.hw,
+                    });
+                }
+            } catch (e) {}
+        } else if (ev.event === 'error') {
+            this.opts.onLog('mic stream switch (' + (ev.error || 'err') + ')');
+        }
+    }
+
+    /**
+     * Capture PTT / 2-step follow-up in `<1ms` via the already-open SmartX stream if armed,
+     * otherwise cleanly fall back to one-shot `captureCeilingMic`.
+     */
+    async capturePtt(opts) {
+        const o = Object.assign({
+            maxDurationSec: 4.2,
+            noPreroll: false,
+            outFile: path.join(this.opts.workDir, 'capture.wav'),
+        }, opts || {});
+
+        if (this.child && this.status === 'armed' && !this.pendingPtt) {
+            const reqId = ++this.reqSeq;
+            try {
+                return await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => {
+                        if (this.pendingPtt && this.pendingPtt.reqId === reqId) {
+                            this.pendingPtt = null;
+                            reject(new Error('ptt stream timeout'));
+                        }
+                    }, Math.round((o.maxDurationSec + 2.2) * 1000));
+                    this.pendingPtt = { reqId, resolve, reject, timer };
+                    const ok = this._sendCmd({
+                        cmd: 'ptt',
+                        reqId,
+                        maxSec: o.maxDurationSec,
+                        noPreroll: !!o.noPreroll,
+                    });
+                    if (!ok) {
+                        clearTimeout(timer);
+                        this.pendingPtt = null;
+                        reject(new Error('ptt stdin write failed'));
+                    }
+                });
+            } catch (e) {
+                this.opts.onLog('instant stream fallback: ' + e.message);
+            }
+        }
+
+        return captureCeilingMic(Object.assign({
+            maxDurationSec: o.maxDurationSec,
+            outFile: o.outFile,
+            swapChannels: this.opts.swapChannels,
+            connectAmRoute: this.opts.connectAmRoute,
+            disconnectAmRoute: this.opts.disconnectAmRoute,
+            mguPython: this.opts.mguPython,
+            smartxHelper: this.opts.smartxHelper,
+            smartxDir: this.opts.smartxDir,
+            onLog: this.opts.onLog,
+        }, o));
+    }
+}
+
 module.exports = {
     SMARTX_PROFILES,
     probeSmartxStack,
     analyzeWavBuffer,
     buildStereoWav,
     captureCeilingMic,
+    MicStreamEngine,
 };

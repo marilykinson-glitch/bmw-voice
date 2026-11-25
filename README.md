@@ -1,15 +1,34 @@
-# Trợ lý BMW (`bmw-voice`) — BMW MGU iDrive 7
+# Trợ lý BMW (`bmw-voice` `v1.1.0`)
 
-Trợ lý giọng nói Tiếng Việt tối giản theo đúng hướng **BMW Intelligent Personal Assistant (IPA)** nguyên bản cho xe BMW iDrive 7 (`MGU SP18`):
+Thay thế trình **BMW Intelligent Personal Assistant (IPA)** nguyên bản bằng Tiếng Việt cho đầu **BMW MGU iDrive 7 (`SP18`)**:
 
-- **Kích hoạt đúng chuẩn zin BMW**: Bấm nút **Mic trên vô-lăng** (tự tắt thông báo *"không hỗ trợ ngôn ngữ"* của đầu zin) hoặc chạm vòng tròn trên màn hình `Trợ lý BMW` -> nói câu lệnh Tiếng Việt -> tự ngắt ngay sau `0.5s` khi dứt lời -> thực thi tức thì và hiện xác nhận ngay trên màn hình.
-- **Tuyệt đối không ngắt hay hạ nhỏ nhạc CarPlay / Bluetooth** (không tải file âm thanh TTS, không chiếm luồng ALSA nền).
-- **An toàn tuyệt đối cho đầu MGU**: Khởi động sau `oapcontroller.service`, `LimitCORE=1`, `0%` CPU khi chờ, không mở thiết bị phần cứng `avb:`/`hw:`.
+- **Gọi rảnh tay `"Hey BMW"` như xe nguyên bản**:
+  - **1 bước**: Nói thẳng *"Hey BMW, chỉnh điều hoà 22 độ"* → xe thực thi ngay và hiện giao diện xác nhận chuẩn BMW.
+  - **2 bước**: Nói *"Hey BMW"* → màn hình xe tự trượt lên giao diện **BMW Intelligent Personal Assistant** (*"Xin chào, tôi đang lắng nghe…"*) kèm dải đèn nội thất nháy phản hồi để nói câu lệnh tiếp theo.
+  - Tiếng nói chuyện phiếm trong khoang lái không có *"Hey BMW"* sẽ tự động được bỏ qua, không bao giờ nhảy thông báo rác.
+- **Bấm nút Mic trên vô-lăng hiện ngay giao diện chuẩn BMW**:
+  - Bấm nút Mic vô-lăng ở bất kỳ màn hình nào (**kể cả đang mở Apple CarPlay, Bản đồ hay Màn hình chính**): tự động tắt câu báo lỗi của đầu zin, **phủ giao diện trợ lý giọng nói chuẩn BMW đè lên thông báo *"Nhập bằng giọng nói không khả dụng"***, bắt mic tức thì `< 1ms` và tự động đóng lại sau `3.2 giây` khi thực thi xong.
+  - Tự động ẩn nhường màn hình ngay lập tức khi gài số lùi (`R` / Camera 360) hoặc có cuộc gọi tới.
+  - **Không phát âm thanh TTS ra loa xe**: giữ nguyên 100% nhạc CarPlay / Bluetooth, không bao giờ ngắt hay nhỏ tiếng.
 
-## 6 Nhóm lệnh nguyên bản BMW hỗ trợ
-1. **Điều hoà 2 vùng & Sấy kính**: *"Điều hoà 22 độ"*, *"Tôi nóng quá"*, *"Tôi lạnh quá"*, *"Max AC"*, *"Mức gió 3"*, *"Bật sấy kính"*, *"Lấy gió trong"*, *"Đồng bộ điều hoà"*.
-2. **Ghế & Vô-lăng**: *"Làm mát ghế mức 2"*, *"Bật sưởi ghế"*, *"Bật massage ghế"*, *"Bật sưởi vô-lăng"*.
-3. **Đèn viền nội thất BMW**: *"Đèn viền màu cam"*, *"Đèn viền màu đồng / trắng / xanh dương / xanh băng / xanh lá / tím"*, *"Độ sáng đèn 85%"*, *"Tắt đèn viền"*.
-4. **Âm lượng & Nhạc**: *"Âm lượng 35%"*, *"Tăng âm lượng"*, *"Nhỏ tiếng lại"*, *"Tắt tiếng"*, *"Bài tiếp theo"*, *"Bài trước"*, *"Tạm dừng nhạc"*.
-5. **Cửa kính & Cửa sổ trời**: *"Hạ kính tài"*, *"Đóng hết kính"*, *"Hé kính"*, *"Mở / Đóng cửa sổ trời"*.
-6. **Tình trạng xe**: *"Tình trạng xe"*, *"Nhiệt độ dầu máy"*, *"Áp suất lốp"*, *"Còn bao nhiêu xăng"*.
+## 6 Nhóm Lệnh Điều Khiển Xe Chuẩn BMW IPA (G30 LCI SP18)
+
+1. **Điều hoà 2 vùng & Kính (`Climate2` / `Climate`)**:
+   - *"Hey BMW chỉnh điều hoà 22 độ"*, *"Ghế phụ 24 độ"*, *"Tôi nóng quá"*, *"Tôi lạnh quá"*, *"Mức gió 3"*, *"Bật MAX AC"*, *"Sấy kính trước"*, *"Lấy gió trong"*.
+2. **Ghế ngồi & Vô-lăng (`Climate2` / `ComfortFunction2` / `SteeringWheelClimate`)**:
+   - *"Bật làm mát ghế tài mức 2"*, *"Sưởi ghế mức 2"*, *"Tắt quạt ghế"*, *"Bật massage ghế"*, *"Sưởi vô-lăng"*.
+3. **Đèn viền nội thất chuẩn menu BMW (`ComfortFunctionIuK`)**:
+   - *"Hey BMW đổi đèn viền màu cam"*, *"Đèn nội thất màu đồng / trắng / xanh dương / xanh băng / xanh lá / tím"*, *"Độ sáng đèn 80%"*, *"Tắt đèn viền"*.
+4. **Âm lượng & Điều khiển nhạc (`CommandControl` / `MediaPlayer`)**:
+   - *"Âm lượng 35%"*, *"Tăng âm lượng"*, *"Giảm âm lượng"*, *"Tắt tiếng"*, *"Bài tiếp theo"*, *"Lùi bài"*, *"Tạm dừng nhạc"*, *"Phát tiếp nhạc"*.
+5. **Cửa kính & Cửa sổ trời (`WindowLifter` / `SunProtectionRoofWindows`)**:
+   - *"Hạ kính ghế tài"*, *"Đóng hết kính"*, *"Hé kính thông gió"*, *"Mở cửa sổ trời"*, *"Đóng rèm trần"*.
+6. **Kiểm tra tình trạng xe (`CDS` / `VehicleInformation` / `TPMS`)**:
+   - *"Hey BMW kiểm tra tình trạng xe"*, *"Áp suất lốp bao nhiêu"*, *"Nhiệt độ dầu máy"*, *"Còn bao nhiêu xăng"*.
+
+## Cài Đặt Trên MGU Store
+
+1. Thêm nguồn GitHub vào **MGU Store → Settings → Sources**: `marilykinson-glitch/bmw-voice` (nhánh `main`).
+2. Cài đặt ứng dụng **Trợ lý BMW** (`bmw_voice` — Store sẽ tự cài dịch vụ nền `bmw-voice` `1.1.0`).
+3. Mở **Trợ lý BMW** trên xe lần đầu, quét mã **QR** bằng điện thoại để dán **Gemini API Key** và bấm **Lưu cấu hình**.
+4. Từ lúc đó trở đi, không cần mở lại app nữa — đang chạy CarPlay hay ở bất kỳ đâu chỉ cần nói **"Hey BMW"** hoặc **bấm nút Mic trên vô-lăng** là dùng như nguyên bản!

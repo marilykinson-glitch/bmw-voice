@@ -94,7 +94,6 @@ function drawIpaOrb(cv, G, t, cx, cy, state, animTick) {
     const ringCol = state === 'listening' ? '#00e5ff' : (state === 'thinking' ? '#38bdf8' : '#0088ff');
     const step = active && ((animTick || 0) & 1) ? 5 : 0;
 
-    // Subtle concentric OEM BMW Intelligent Personal Assistant rings
     cv.circle(cx, cy, 86 + step, G.withAlpha(ringCol, active ? 0.14 : 0.07));
     cv.circle(cx, cy, 66 + Math.floor(step / 2), G.withAlpha(ringCol, active ? 0.30 : 0.16));
     cv.circle(cx, cy, 48, G.withAlpha(ringCol, 0.92));
@@ -118,8 +117,8 @@ function drawQrSetupScreen(cv, G, t, top, bottom, v, act) {
             tx, boxY + 90, 17, hasKey ? '#2fd27a' : '#ffb020', { literal: true, font: 'bold' });
 
         cv.text('1. Kết nối điện thoại cùng mạng Wi-Fi / Hotspot với đầu xe MGU.', tx, boxY + 132, 16, t.dim, { literal: true, font: 'label' });
-        cv.text('2. Quét mã QR bên trái (hoặc mở địa chỉ bên dưới) rồi dán Gemini API Key.', tx, boxY + 162, 16, t.dim, { literal: true, font: 'label' });
-        cv.text('3. Sau khi lưu xong, chỉ cần bấm nút Mic trên vô-lăng để nói Tiếng Việt.', tx, boxY + 192, 16, t.dim, { literal: true, font: 'label' });
+        cv.text('2. Quét mã QR bên trái rồi dán Gemini API Key một lần duy nhất.', tx, boxY + 162, 16, t.dim, { literal: true, font: 'label' });
+        cv.text('3. Sau đó ở bất kỳ màn hình nào: nói "Hey BMW" hoặc bấm nút Mic vô-lăng!', tx, boxY + 192, 16, t.dim, { literal: true, font: 'label' });
 
         cv.text('ĐỊA CHỈ:', tx, boxY + 242, 15, t.dim, { literal: true, font: 'bold' });
         cv.text(fit(cv, v.host || '', 19, { literal: true, font: 'bold' }, tw - 260), tx + 92, boxY + 242, 19, '#38bdf8', { literal: true, font: 'bold' });
@@ -146,13 +145,16 @@ function draw(cv, G, t, v, act) {
 
     const state = v.assistantState || 'idle';
     const hasKey = !!(v.settings && v.settings.hasApiKey);
+    const wakeArmed = v.wakeStatus === 'armed';
     const badge = state === 'listening'
         ? { text: 'ĐANG NGHE…', color: 'info' }
         : (state === 'thinking'
             ? { text: 'ĐANG XỬ LÝ…', color: 'info' }
             : (!v.daemonUp
                 ? { text: 'ĐANG KẾT NỐI', color: 'warn' }
-                : (hasKey ? { text: 'SẴN SÀNG', color: 'ok' } : { text: 'CHƯA CÀI KEY', color: 'warn' })));
+                : (hasKey
+                    ? { text: wakeArmed ? 'HEY BMW · SẴN SÀNG' : 'MIC VÔ-LĂNG · SẴN SÀNG', color: 'ok' }
+                    : { text: 'CHƯA CÀI KEY', color: 'warn' })));
 
     G.frame(cv, t, [], -1, [badge]);
 
@@ -169,15 +171,15 @@ function draw(cv, G, t, v, act) {
     drawIpaOrb(cv, G, t, orbCx, orbCy, state, v.animTick);
 
     const orbStatus = state === 'listening'
-        ? 'ĐANG NGHE MIC TRẦN…'
+        ? 'ĐANG LẮNG NGHE…'
         : (state === 'thinking'
             ? 'ĐANG THỰC THI…'
             : (v.car && v.car.callActive
                 ? 'ĐANG CÓ CUỘC GỌI'
-                : (hasKey ? 'BẤM MIC VÔ-LĂNG' : 'BẤM CÀI ĐẶT QR')));
+                : (hasKey ? '"HEY BMW" · MIC VÔ-LĂNG' : 'BẤM CÀI ĐẶT QR')));
     const orbSub = state === 'listening'
-        ? 'Nói xong tự ngắt ngay'
-        : (hasKey ? 'hoặc chạm vòng tròn để nói' : 'để dán Gemini API Key 1 lần');
+        ? 'Ngừng nói 0.5s tự thực thi'
+        : (hasKey ? 'Tự hiện giao diện trên mọi màn hình' : 'để dán Gemini API Key 1 lần');
 
     cv.text(orbStatus, orbCx, orbCy + 118, 17, state === 'listening' ? '#00e5ff' : t.text, { literal: true, align: 'center', font: 'bold' });
     cv.text(orbSub, orbCx, orbCy + 144, 14, t.dim, { literal: true, align: 'center', font: 'label' });
@@ -208,8 +210,8 @@ function draw(cv, G, t, v, act) {
     const zonePrefix = turn.speakerZone === 'passenger' ? '[GHẾ PHỤ] ' : '';
     const lineTop = turn.transcript
         ? (zonePrefix + '“' + turn.transcript + '”')
-        : 'Khẩu lệnh Tiếng Việt theo chuẩn trợ lý nguyên bản BMW';
-    const lineMain = (turn.ok && !isIdleMsg ? '✓ ' : '') + (turn.replyVi || 'Bấm nút Mic trên vô-lăng để ra lệnh.');
+        : 'Hoạt động trên mọi màn hình (CarPlay / Bản đồ / Menu chính)';
+    const lineMain = (turn.ok && !isIdleMsg ? '✓ ' : '') + (turn.replyVi || 'Nói "Hey BMW" hoặc bấm nút Mic trên vô-lăng.');
 
     cv.text(fit(cv, lineTop, 17, { literal: true, font: 'label' }, rw - 44), rx + 24, boxY + 46, 17, '#93c5fd', { literal: true, font: 'label' });
     cv.text(fit(cv, lineMain, 24, { literal: true, font: 'bold' }, rw - 44), rx + 24, boxY + 102, 24, replyColor, { literal: true, font: 'bold' });
@@ -234,7 +236,7 @@ function draw(cv, G, t, v, act) {
 
     // Subtle Voice Examples Line
     cv.text(
-        fit(cv, 'Ví dụ: "Điều hoà 22 độ" · "Tôi nóng quá" · "Làm mát ghế mức 2" · "Đèn viền màu cam" · "Âm lượng 35%" · "Bài tiếp theo" · "Tình trạng xe"', 14, { literal: true, font: 'label' }, rw),
+        fit(cv, 'Ví dụ: "Hey BMW điều hoà 22 độ" · "Hey BMW làm mát ghế mức 2" · "Đèn viền màu cam" · "Bài tiếp theo" · "Tình trạng xe"', 14, { literal: true, font: 'label' }, rw),
         rx,
         stripY + stripH + 28,
         14,

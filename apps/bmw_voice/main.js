@@ -1,8 +1,8 @@
 'use strict';
 /**
- * main.js - Instant Zero-Lag iDrive 7 Entry Point for `bmw_voice` (`v1.0.0`).
+ * main.js - Instant Zero-Lag iDrive 7 Entry Point for `bmw_voice` (`v1.1.0`).
  *
- *   - Asynchronous background polling of `/run/bmw-voice/hmi.json` (~0.9 KB).
+ *   - Pauses `hmi.json` polling completely while app screen is in the background (`0.00%` idle CPU).
  *   - Software-path `lastSoftWords` fast-skip (`0.0%` CPU when screen is steady).
  *   - Instant `<1ms` Unix socket IPC (`/run/bmw-voice/ctl.sock`) with immediate visual feedback.
  *
@@ -26,6 +26,7 @@ mgu.run({
         let showQr = false, userClosedQr = false, animTick = 0;
         let lastSig = '', polling = false;
         let lastSoftWords = null, lastSoftAt = 0;
+        let pollTimer = null;
 
         let pendingUntil = 0;
         let pendingState = '';
@@ -87,6 +88,19 @@ mgu.run({
             });
         }
 
+        function syncPollTimer(visible) {
+            if (visible) {
+                if (!pollTimer) {
+                    pollTimer = setInterval(pollAsync, 450);
+                    if (pollTimer.unref) pollTimer.unref();
+                }
+                pollAsync();
+            } else if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        }
+
         function writeFallback(payload) {
             const ramCmd = path.join(RUN, 'app', 'command.json');
             try {
@@ -139,7 +153,7 @@ mgu.run({
                     ok: true,
                     speakerZone: 'driver',
                     transcript: '',
-                    replyVi: 'Đang nghe câu lệnh từ Mic trần xe…',
+                    replyVi: 'Xin chào, tôi đang lắng nghe…',
                 };
                 pendingUntil = Date.now() + 5500;
                 return repaint(true);
@@ -176,7 +190,8 @@ mgu.run({
                 pin: s ? s.pin : '1234',
                 ipCount: (s && Array.isArray(s.ips)) ? s.ips.length : 1,
                 assistantState: effState,
-                settings: (s && s.settings) || { hasApiKey: false, apiKeyMasked: '' },
+                wakeStatus: (s && s.wakeStatus) || 'off',
+                settings: (s && s.settings) || { hasApiKey: false, apiKeyMasked: '', handsFreeWake: true },
                 car: (s && s.car) || {
                     climate: { on: true, tempDriverC: 22.5, tempPassengerC: 22.5, fanLevel: 2, seatHeatDriver: 0, seatCoolDriver: 0 },
                     ambient: { on: true, name: 'Cam BMW', hex: '#FF5500', brightness: 80 },
@@ -186,7 +201,7 @@ mgu.run({
                     idle: true,
                     ok: true,
                     transcript: '',
-                    replyVi: 'Bấm nút Mic trên vô-lăng hoặc chạm biểu tượng Mic để nói lệnh Tiếng Việt.',
+                    replyVi: 'Nói "Hey BMW" hoặc bấm nút Mic trên vô-lăng để ra lệnh Tiếng Việt.',
                 },
             };
         }
@@ -211,18 +226,23 @@ mgu.run({
         };
 
         readInitialSync();
-        const timer = setInterval(pollAsync, 450);
-        if (timer.unref) timer.unref();
-
         loop = ctx.loop('MAIN', 2, render);
         if (ctx.onLayout) ctx.onLayout(() => repaint(true));
-        if (ui.onVisible) ui.onVisible(() => repaint(true));
+        if (ui.onVisible) {
+            ui.onVisible((name, vis) => {
+                if (name === 'MAIN') {
+                    syncPollTimer(vis);
+                    if (vis) repaint(true);
+                }
+            });
+        }
+        syncPollTimer(!ui.isVisible || ui.isVisible('MAIN'));
 
         ['BTN_MIC', 'BTN_QR'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
         ui.onClick('BTN_MIC', acts.triggerMic);
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.0.0 ready');
+        log.info('bmw_voice v1.1.0 ready');
     },
 });

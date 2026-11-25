@@ -44,11 +44,17 @@
   }
   .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--cyan); margin-bottom: 12px; }
   label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
-  input, select {
+  input[type="password"], input[type="text"], #askInput, select {
     width: 100%; padding: 11px 13px; border-radius: 10px; border: 1px solid var(--border);
     background: #090e1a; color: #fff; font-size: 15px; margin-bottom: 12px; outline: none;
   }
   input:focus, select:focus { border-color: var(--cyan); }
+  .toggle-row {
+    display: flex; align-items: center; gap: 10px; padding: 11px 13px; margin-bottom: 14px;
+    border-radius: 10px; background: #090e1a; border: 1px solid var(--border); cursor: pointer;
+    color: var(--text); font-size: 14px;
+  }
+  .toggle-row input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--blue); flex-shrink: 0; }
   .btn {
     width: 100%; padding: 12px 16px; border-radius: 10px; border: none;
     background: var(--blue); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer;
@@ -81,13 +87,18 @@
   </div>
 
   <div class="panel">
-    <h2>1. Cấu hình Gemini API Key &amp; Nút Mic Vô-lăng</h2>
-    <label>Gemini API Key (dùng để giải mã giọng nói Tiếng Việt từ Mic trần xe):</label>
+    <h2>1. Cấu hình "Hey BMW" &amp; Nút Mic Vô-lăng</h2>
+    <label>Gemini API Key (dùng để nhận diện Tiếng Việt từ Mic trần xe):</label>
     <input type="password" id="apiKey" placeholder="AIzaSy...">
+
+    <label class="toggle-row" for="handsFreeWake">
+      <input type="checkbox" id="handsFreeWake" checked>
+      <span>Gọi rảnh tay <b>"Hey BMW"</b> mọi lúc (nói <i>"Hey BMW + câu lệnh"</i> hoặc nói <i>"Hey BMW"</i> để bật giao diện trợ lý)</span>
+    </label>
 
     <label>Cách gọi trên nút Mic vô-lăng:</label>
     <select id="pttTrigger">
-      <option value="short_press">Bấm nút Mic vô-lăng (mặc định như zin BMW)</option>
+      <option value="short_press">Bấm nút Mic vô-lăng (hiện giao diện trợ lý chuẩn BMW)</option>
       <option value="long_press">Nhấn giữ nút Mic vô-lăng &gt; 0.6 giây</option>
       <option value="double_press">Bấm đúp 2 lần nút Mic vô-lăng</option>
     </select>
@@ -99,11 +110,11 @@
   <div class="panel">
     <h2>2. Thử lệnh nhanh</h2>
     <div class="cmd-row">
-      <input id="askInput" placeholder="Ví dụ: Điều hoà 22 độ, Đèn viền màu cam..." onkeydown="if(event.key==='Enter')sendCmd()">
+      <input id="askInput" placeholder="Ví dụ: Hey BMW điều hoà 22 độ, Đèn viền màu cam..." onkeydown="if(event.key==='Enter')sendCmd()">
       <button class="btn" onclick="sendCmd()">Gửi</button>
     </div>
     <div class="chips">
-      <span class="chip" onclick="sendCmd('Điều hoà 22 độ mức gió 3')">Điều hoà 22°C · Gió 3</span>
+      <span class="chip" onclick="sendCmd('Hey BMW điều hoà 22 độ mức gió 3')">Hey BMW · Điều hoà 22°C</span>
       <span class="chip" onclick="sendCmd('Làm mát ghế tài mức 2')">Làm mát ghế mức 2</span>
       <span class="chip" onclick="sendCmd('Đèn viền màu cam độ sáng 85%')">Đèn viền Cam 85%</span>
       <span class="chip" onclick="sendCmd('Âm lượng 30%')">Âm lượng 30%</span>
@@ -116,6 +127,8 @@
 
 <script>
   var PIN = (new URLSearchParams(location.search)).get('pin') || '';
+  var dirtyToggle = false;
+  document.getElementById('handsFreeWake').addEventListener('change', function() { dirtyToggle = true; });
 
   function api(path, method, body) {
     var sep = path.indexOf('?') >= 0 ? '&' : '?';
@@ -130,7 +143,7 @@
     if (!s) return;
     var kb = document.getElementById('keyBadge');
     if (s.settings && s.settings.hasApiKey) {
-      kb.textContent = 'Đã cài Key: ' + s.settings.apiKeyMasked;
+      kb.textContent = (s.wakeStatus === 'armed' ? '🟢 Hey BMW Sẵn sàng · ' : 'Đã cài Key · ') + s.settings.apiKeyMasked;
       kb.className = 'badge ok';
     } else {
       kb.textContent = 'Chưa cài Key';
@@ -138,6 +151,9 @@
     }
     if (document.activeElement !== document.getElementById('pttTrigger') && s.settings) {
       document.getElementById('pttTrigger').value = s.settings.pttTrigger || 'short_press';
+    }
+    if (!dirtyToggle && s.settings && typeof s.settings.handsFreeWake === 'boolean') {
+      document.getElementById('handsFreeWake').checked = s.settings.handsFreeWake;
     }
     var car = s.car || {};
     var aud = s.audio || {};
@@ -151,13 +167,17 @@
   }
 
   function saveSettings() {
-    var body = { pttTrigger: document.getElementById('pttTrigger').value };
+    var body = {
+      pttTrigger: document.getElementById('pttTrigger').value,
+      handsFreeWake: !!document.getElementById('handsFreeWake').checked
+    };
     var k = document.getElementById('apiKey').value.trim();
     if (k) body.apiKey = k;
     api('/api/settings', 'POST', body).then(function(r) {
       if (r.ok) {
+        dirtyToggle = false;
         document.getElementById('apiKey').value = '';
-        document.getElementById('saveNotice').textContent = '✓ Đã lưu cấu hình thành công! Có thể đóng trang này và bấm nút Mic vô-lăng.';
+        document.getElementById('saveNotice').textContent = '✓ Đã lưu! Từ giờ bạn có thể gọi "Hey BMW" hoặc bấm nút Mic trên vô-lăng ở bất kỳ màn hình nào.';
         render(r.state);
       }
     });
