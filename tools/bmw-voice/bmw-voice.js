@@ -1,16 +1,17 @@
 'use strict';
 /**
- * bmw-voice.js - OEM-Style Vietnamese Voice Assistant Replacement for BMW MGU iDrive 7 (`v1.1.0`).
+ * bmw-voice.js - OEM-Style Vietnamese Voice Assistant Replacement for BMW MGU iDrive 7 (`v1.1.1`).
  *
  * Experience:
  *   1. Hands-Free `"Hey BMW"`:
  *      - 1-shot ("Hey BMW chỉnh điều hoà 22 độ") -> executes immediately & glides OEM BMW IPA overlay onto screen.
- *      - 2-step ("Hey BMW") -> pops up OEM BMW IPA overlay ("Xin chào, tôi đang lắng nghe…") & listens for command.
- *      - Cabin chatter without "Hey BMW" is silently ignored (zero popups, zero `[IGNORE]` text).
+ *      - 2-step ("Hey BMW") -> opens BMW Assistant screen / IPA overlay ("Xin chào, tôi đang lắng nghe…") & listens.
+ *      - Cabin chatter without "Hey BMW" is silently ignored (zero popups).
  *   2. Steering Wheel Mic Button (`PTT`):
- *      - Silences BMW's unsupported-language audio prompt (`Prompter.abortPrompt`), pops up the OEM BMW IPA overlay
- *        directly on top of CarPlay / Home / BMW's "Không khả dụng" banner, captures ceiling mic in `<1ms` via
- *        the persistent SmartX stream, and executes immediately with zero CarPlay music interruption.
+ *      - Fires immediately on physical button press (`0ms` release wait), silences BMW's unsupported-language prompt,
+ *        pushes `{ event: 'voice_ui', action: 'open' }` over `/run/bmw-voice/ctl.sock` so `bmw_voice` natively replaces
+ *        BMW's `"Nhập bằng giọng nói không khả dụng"` screen in `HmiMain3D` (and auto-closes 3.2s after execution!),
+ *        while `IpaOverlay` covers Wayland IVI layers seamlessly whenever `bmw_voice` is not yet in front.
  *
  * Node 8 (ES2017) compatible.
  */
@@ -29,7 +30,7 @@ const MicCapture = require('./mic-capture');
 const NluBrain = require('./nlu-brain');
 const { IpaOverlay } = require('./ipa-overlay');
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const FW_TAG = 'bmw-voice';
 const APP_RE = /^bmw_voice\d*$/;
 
@@ -113,7 +114,7 @@ function discoverLanAddresses(cfg) {
     const out = [];
     const nets = os.networkInterfaces();
     Object.keys(nets).forEach((name) => (nets[name] || []).forEach((a) => {
-        if (a.internal || (a.family !== 'IPv4' && a.family !== 4) || /^169\.254\./.test(a.address)) return;
+        if (a.internal || (a.family !== 'IPv4' && a.family !== 4) || /^(?:169\.254\.|160\.48\.)/.test(a.address)) return;
         const range = /^192\.168\./.test(a.address) ? 0 : /^172\.(1[6-9]|2\d|3[01])\./.test(a.address) ? 1 : /^10\./.test(a.address) ? 2 : 3;
         out.push({ ip: a.address, rank: (name === via ? 0 : /^(wl|ml|uap|ap|wifi)/i.test(name) ? 10 : 20) + range });
     }));
@@ -194,6 +195,8 @@ class BmwVoiceDaemon {
             actions: [],
         };
         this.seenCmdIds = [];
+        this.hmiClients = [];
+        this.hmiAppVisible = false;
         this.turnBusy = false;
         this.listenStartedAt = 0;
         this.statusTimer = null;
@@ -221,6 +224,7 @@ class BmwVoiceDaemon {
                 }
                 this.scheduleStatusWrite();
             },
+            shouldFireImmediateShortPress: () => this.settings.pttTrigger === 'short_press',
             onPttEvent: (ev) => this.onSteeringWheelPtt(ev),
             onLog: (m) => this.log(m),
         });
@@ -263,6 +267,27 @@ class BmwVoiceDaemon {
         this.seenCmdIds.push(id);
         if (this.seenCmdIds.length > 48) this.seenCmdIds.shift();
         return true;
+    }
+
+    pushHmiEvent(action, extra, prebuiltState) {
+        if (!this.hmiClients.length) return;
+        const payload = JSON.stringify(Object.assign({
+            event: 'voice_ui',
+            action: action || 'state',
+            state: prebuiltState || this.buildHmiState(),
+        }, extra || {})) + '\n';
+        for (let i = this.hmiClients.length - 1; i >= 0; i--) {
+            const c = this.hmiClients[i];
+            if (!c || c.destroyed) {
+                this.hmiClients.splice(i, 1);
+                continue;
+            }
+            try { c.write(payload); } catch (e) { this.hmiClients.splice(i, 1); }
+        }
+    }
+
+    shouldShowOverlay() {
+        return !this.cfg.noOverlay && !this.hmiAppVisible && this.car.state.gear !== 'R' && !this.car.state.callActive;
     }
 
     publicSettings() {
@@ -352,6 +377,7 @@ class BmwVoiceDaemon {
             this.lastWriteAt = now;
             this.statusWriteCount++;
             writeAtomic(path.join(this.cfg.run, 'hmi.json'), JSON.stringify(hmi), 0o644);
+            this.pushHmiEvent('state', null, hmi);
         } catch (e) {}
     }
 
@@ -378,7 +404,7 @@ class BmwVoiceDaemon {
             return;
         }
 
-        this.log('PTT (' + ev.kind + ', ' + ev.heldMs + 'ms) -> BMW IPA overlay + instant mic');
+        this.log('PTT (' + ev.kind + ', ' + ev.heldMs + 'ms) -> BMW screen + instant mic');
         this.captureAndExecute({ fromSteeringWheel: true }).catch((e) => this.log('PTT error: ' + e.message));
     }
 
@@ -400,6 +426,10 @@ class BmwVoiceDaemon {
                 uplinkOpts: this.uplinkOpts,
             });
 
+            if (turn && turn.netError) {
+                this.log('Hey BMW network warn: ' + turn.netError);
+            }
+
             // 1. Cabin chatter without "Hey BMW" -> silently ignore (zero UI popups, zero status churn)
             if (!turn || turn.ignored) {
                 return;
@@ -410,14 +440,26 @@ class BmwVoiceDaemon {
                 rightDb: utt.analysis ? utt.analysis.rightDb : -30,
             };
 
-            // 2. 2-Step "Hey BMW" -> Pop up OEM BMW IPA Overlay & immediately listen for command!
+            // 2. 2-Step "Hey BMW" -> Open BMW Assistant screen / IPA Overlay & immediately listen for command!
             if (turn.wakeOnly) {
-                this.log('Hey BMW wake detected (' + zone + ') -> opening IPA overlay for follow-up');
+                this.log('Hey BMW wake detected (' + zone + ') -> opening assistant for follow-up');
                 this.assistantState = 'listening';
                 this.listenStartedAt = Date.now();
+                this.lastTurn = {
+                    at: Date.now(),
+                    ok: true,
+                    idle: false,
+                    speakerZone: zone,
+                    transcript: 'Hey BMW',
+                    replyVi: 'Xin chào, tôi đang lắng nghe…',
+                    actions: [],
+                };
                 this.writeStatusFile(true);
-                this.car.pulseIpaLight(zone === 'passenger' ? 'listenPassenger' : 'listenDriver').catch(() => {});
                 if (this.car.state.gear !== 'R') {
+                    this.pushHmiEvent('open', { reason: 'hey_bmw' });
+                }
+                this.car.pulseIpaLight(zone === 'passenger' ? 'listenPassenger' : 'listenDriver').catch(() => {});
+                if (this.shouldShowOverlay()) {
                     this.overlay.showListening({
                         wakeTriggered: true,
                         speakerZone: zone,
@@ -438,44 +480,57 @@ class BmwVoiceDaemon {
                 };
                 this.assistantState = 'thinking';
                 this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') {
+                if (this.shouldShowOverlay()) {
                     this.overlay.showThinking({ speakerZone: followZone });
                 }
 
-                const followTurn = await NluBrain.processVoiceOrText({
-                    audioWavBase64: followCap.wavBuffer.toString('base64'),
-                    audioMimeType: 'audio/wav',
-                    speakerZone: followZone,
-                    wakeMode: false,
-                    apiKey: this.settings.apiKey,
-                    model: this.settings.model,
-                    carController: this.car,
-                    uplinkOpts: this.uplinkOpts,
-                });
+                const followTurn = (followCap.voicedChunks === 0 && typeof followCap.snrDb === 'number' && followCap.snrDb < 4.0)
+                    ? {
+                        at: Date.now(),
+                        ok: false,
+                        speakerZone: followZone,
+                        transcript: '',
+                        replyVi: 'Chưa nghe thấy câu lệnh - mời gọi "Hey BMW" rồi nói rõ lệnh điều khiển.',
+                        actions: [],
+                    }
+                    : await NluBrain.processVoiceOrText({
+                        audioWavBase64: followCap.wavBuffer.toString('base64'),
+                        audioMimeType: 'audio/wav',
+                        speakerZone: followZone,
+                        wakeMode: false,
+                        apiKey: this.settings.apiKey,
+                        model: this.settings.model,
+                        carController: this.car,
+                        uplinkOpts: this.uplinkOpts,
+                    });
 
                 this.lastTurn = followTurn;
                 this.assistantState = 'idle';
                 this.car.pulseIpaLight('off').catch(() => {});
                 this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') {
+                this.pushHmiEvent('finish', { holdMs: 3200 });
+                if (this.shouldShowOverlay()) {
                     this.overlay.showResult(followTurn, 3200);
                 }
                 return;
             }
 
-            // 3. 1-Shot "Hey BMW + command" -> Command already executed! Show OEM BMW IPA confirmation banner!
+            // 3. 1-Shot "Hey BMW + command" -> Command already executed! Show OEM BMW IPA confirmation!
             this.log('Hey BMW 1-shot executed: ' + (turn.transcript || '') + ' -> ' + (turn.replyVi || ''));
             this.lastTurn = turn;
             this.car.pulseIpaLight('center').catch(() => {});
             setTimeout(() => this.car.pulseIpaLight('off').catch(() => {}), 1400);
             this.writeStatusFile(true);
-            if (this.car.state.gear !== 'R') {
+            if (this.shouldShowOverlay() && this.overlay.ready) {
                 this.overlay.showResult(turn, 3400);
+            } else if (!this.hmiAppVisible && this.car.state.gear !== 'R') {
+                this.pushHmiEvent('open_result', { holdMs: 3200 });
             }
         } catch (e) {
             this.assistantState = 'idle';
             this.overlay.hide();
             this.car.pulseIpaLight('off').catch(() => {});
+            this.pushHmiEvent('finish', { holdMs: 2200 });
             this.log('Hey BMW follow-up warn: ' + e.message);
         } finally {
             this.assistantState = 'idle';
@@ -494,7 +549,7 @@ class BmwVoiceDaemon {
                 ok: false,
                 speakerZone: 'driver',
                 transcript: '',
-                replyVi: 'Đang có cuộc gọi điện thoại — tạm nhường Mic xe.',
+                replyVi: 'Đang có cuộc gọi điện thoại - tạm nhường Mic xe.',
                 actions: [],
             };
             this.writeStatusFile(true);
@@ -508,11 +563,14 @@ class BmwVoiceDaemon {
                 ok: false,
                 speakerZone: 'driver',
                 transcript: '',
-                replyVi: 'Mở ứng dụng "Trợ lý BMW" trên màn hình xe để quét QR dán Gemini API Key lần đầu.',
+                replyVi: 'Bấm "Cài đặt QR" bên dưới để quét mã dán Gemini API Key lần đầu.',
                 actions: [],
             };
             this.writeStatusFile(true);
-            if (this.car.state.gear !== 'R') {
+            if (o.fromSteeringWheel && this.car.state.gear !== 'R') {
+                this.pushHmiEvent('open_result', { holdMs: 6500 });
+            }
+            if (this.shouldShowOverlay()) {
                 this.overlay.showResult(this.lastTurn, 4200);
                 if (o.fromSteeringWheel) this.overlay._scheduleTopReassertions();
             }
@@ -541,10 +599,22 @@ class BmwVoiceDaemon {
         this.turnBusy = true;
         this.listenStartedAt = Date.now();
         this.assistantState = 'listening';
+        this.lastTurn = {
+            at: Date.now(),
+            ok: true,
+            idle: false,
+            speakerZone: 'driver',
+            transcript: '',
+            replyVi: 'Xin chào, tôi đang lắng nghe…',
+            actions: [],
+        };
         this.writeStatusFile(true);
+        if (o.fromSteeringWheel && this.car.state.gear !== 'R') {
+            this.pushHmiEvent('open', { reason: 'ptt' });
+        }
         this.car.pulseIpaLight('listenDriver').catch(() => {});
 
-        if (this.car.state.gear !== 'R') {
+        if (this.shouldShowOverlay()) {
             this.overlay.showListening({
                 reassertTop: !!o.fromSteeringWheel,
                 wakeTriggered: false,
@@ -562,9 +632,30 @@ class BmwVoiceDaemon {
             this.micLevels = { leftDb: cap.analysis.leftDb, rightDb: cap.analysis.rightDb };
             let zone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
 
+            // Reject pure silence/road-hum clips locally without wasting a Gemini roundtrip or risking hallucinations
+            if (cap.voicedChunks === 0 && typeof cap.snrDb === 'number' && cap.snrDb < 3.8) {
+                const quietTurn = {
+                    at: Date.now(),
+                    ok: false,
+                    speakerZone: zone,
+                    transcript: '',
+                    replyVi: 'Chưa nghe thấy giọng nói - mời đọc lệnh gần Mic trần hơn.',
+                    actions: [],
+                };
+                this.lastTurn = quietTurn;
+                this.assistantState = 'idle';
+                this.car.pulseIpaLight('off').catch(() => {});
+                this.writeStatusFile(true);
+                this.pushHmiEvent('finish', { holdMs: 2800 });
+                if (this.shouldShowOverlay()) {
+                    this.overlay.showResult(quietTurn, 2800);
+                }
+                return { ok: false, turn: quietTurn };
+            }
+
             this.assistantState = 'thinking';
             this.writeStatusFile(true);
-            if (this.car.state.gear !== 'R') {
+            if (this.shouldShowOverlay()) {
                 this.overlay.showThinking({ speakerZone: zone });
             }
 
@@ -583,8 +674,9 @@ class BmwVoiceDaemon {
             if (turn && turn.wakeOnly) {
                 this.assistantState = 'listening';
                 this.listenStartedAt = Date.now();
+                this.lastTurn = turn;
                 this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') {
+                if (this.shouldShowOverlay()) {
                     this.overlay.showListening({
                         wakeTriggered: true,
                         speakerZone: zone,
@@ -599,7 +691,7 @@ class BmwVoiceDaemon {
                 zone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : zone;
                 this.assistantState = 'thinking';
                 this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') this.overlay.showThinking({ speakerZone: zone });
+                if (this.shouldShowOverlay()) this.overlay.showThinking({ speakerZone: zone });
                 turn = await NluBrain.processVoiceOrText({
                     audioWavBase64: cap.wavBuffer.toString('base64'),
                     audioMimeType: 'audio/wav',
@@ -616,7 +708,8 @@ class BmwVoiceDaemon {
             this.assistantState = 'idle';
             this.car.pulseIpaLight('off').catch(() => {});
             this.writeStatusFile(true);
-            if (this.car.state.gear !== 'R') {
+            this.pushHmiEvent('finish', { holdMs: 3200 });
+            if (this.shouldShowOverlay()) {
                 this.overlay.showResult(turn, 3200);
             }
             return { ok: turn.ok, turn };
@@ -628,11 +721,12 @@ class BmwVoiceDaemon {
                 ok: false,
                 speakerZone: 'driver',
                 transcript: '',
-                replyVi: 'Không thu được Mic trần (' + e.message.slice(0, 90) + ').',
+                replyVi: 'Không thu được Mic trần (' + NluBrain.sanitizePlainQuotes(e.message).slice(0, 85) + ').',
                 actions: [],
             };
             this.writeStatusFile(true);
-            if (this.car.state.gear !== 'R') {
+            this.pushHmiEvent('finish', { holdMs: 3200 });
+            if (this.shouldShowOverlay()) {
                 this.overlay.showResult(this.lastTurn, 3200);
             }
             return { ok: false, error: e.message, turn: this.lastTurn };
@@ -677,7 +771,7 @@ class BmwVoiceDaemon {
                 this.lastTurn = turn;
                 this.assistantState = 'idle';
                 this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') {
+                if (this.shouldShowOverlay()) {
                     this.overlay.showResult(turn, 2800);
                 }
             }
@@ -688,7 +782,31 @@ class BmwVoiceDaemon {
         }
     }
 
-    async executeHmiCommand(cmd, arg) {
+    async executeHmiCommand(cmd, arg, clientSock) {
+        if (cmd === 'subscribe_hmi') {
+            if (clientSock && this.hmiClients.indexOf(clientSock) < 0) {
+                this.hmiClients.push(clientSock);
+            }
+            if (arg && typeof arg.visible === 'boolean') {
+                this.hmiAppVisible = arg.visible;
+                if (this.hmiAppVisible) this.overlay.hide();
+            }
+            if (clientSock && !clientSock.destroyed) {
+                try {
+                    clientSock.write(JSON.stringify({
+                        event: 'voice_ui',
+                        action: 'state',
+                        state: this.buildHmiState(),
+                    }) + '\n');
+                } catch (e) {}
+            }
+            return { ok: true };
+        }
+        if (cmd === 'app_visible') {
+            this.hmiAppVisible = !!(arg && arg.visible);
+            if (this.hmiAppVisible) this.overlay.hide();
+            return { ok: true };
+        }
         if (cmd === 'ptt_trigger') return this.captureAndExecute({ fromSteeringWheel: false });
         if (cmd === 'ask_text' && arg && arg.text) {
             return this.handleTurn({ text: String(arg.text), speakerZone: arg.speakerZone || 'driver' });
@@ -711,7 +829,7 @@ class BmwVoiceDaemon {
             if (!c || !c.cmd) continue;
             try { fs.unlinkSync(candidates[i]); } catch (e) {}
             if (!this.markCmdSeen(c.id)) continue;
-            this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('cmd error: ' + e.message));
+            this.executeHmiCommand(c.cmd, c.arg || {}, null).catch((e) => this.log('cmd error: ' + e.message));
         }
     }
 
@@ -816,6 +934,13 @@ class BmwVoiceDaemon {
             const srv = net.createServer((client) => {
                 let buf = '';
                 client.setEncoding('utf8');
+                const dropClient = () => {
+                    const idx = this.hmiClients.indexOf(client);
+                    if (idx >= 0) {
+                        this.hmiClients.splice(idx, 1);
+                        if (!this.hmiClients.length) this.hmiAppVisible = false;
+                    }
+                };
                 client.on('data', (chunk) => {
                     buf += chunk;
                     let idx;
@@ -826,12 +951,13 @@ class BmwVoiceDaemon {
                         try {
                             const c = JSON.parse(line);
                             if (c && c.cmd && this.markCmdSeen(c.id)) {
-                                this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('ctl.sock error: ' + e.message));
+                                this.executeHmiCommand(c.cmd, c.arg || {}, client).catch((e) => this.log('ctl.sock error: ' + e.message));
                             }
                         } catch (e) {}
                     }
                 });
-                client.on('error', () => {});
+                client.on('close', dropClient);
+                client.on('error', dropClient);
             });
             srv.on('error', () => resolve(null));
             srv.listen(sockPath, () => {
@@ -919,6 +1045,10 @@ class BmwVoiceDaemon {
         await this.micStream.stop();
         this.overlay.stop();
         Up.close(this.uplinkOpts);
+        for (let i = 0; i < this.hmiClients.length; i++) {
+            try { this.hmiClients[i].destroy(); } catch (e) {}
+        }
+        this.hmiClients.length = 0;
         if (this.ctlServer) {
             await new Promise((r) => this.ctlServer.close(r));
             this.ctlServer = null;

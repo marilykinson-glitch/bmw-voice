@@ -112,19 +112,29 @@ function coerceByDataRef(datatypes, dataRef, val, depth) {
     return val !== undefined ? val : (t.defaultValue !== undefined ? t.defaultValue : 0);
 }
 
+function snapBmwIhkaTempC(tempC) {
+    const raw = +(Math.round((Number(tempC) || 22) * 2) / 2).toFixed(1);
+    const clamped = Math.max(16, Math.min(28, raw));
+    // Hot-climate BMW G30 IHKA (S823A) steps jump directly from 16.0°C (LOW) to 18.0°C..28.0°C
+    if (clamped > 16.0 && clamped < 18.0) {
+        return clamped < 16.8 ? 16.0 : 18.0;
+    }
+    return clamped;
+}
+
 function decodeSp18TempByte(raw) {
     if (typeof raw !== 'number' || !isFinite(raw) || raw <= 0 || raw >= 250) return null;
     if (raw >= 30 && raw <= 64) return +(raw * 0.5).toFixed(1);
-    if (raw >= 15 && raw <= 29) return raw;
+    if (raw >= 0 && raw <= 28) return +(16 + raw * 0.5).toFixed(1);
     return null;
 }
 
 function encodeSp18TempByte(tempC, observedRaw) {
-    const clamped = Math.max(16, Math.min(28, +(Number(tempC) || 22)));
-    if (typeof observedRaw === 'number' && observedRaw >= 15 && observedRaw <= 29) {
-        return Math.round(clamped);
+    const snapped = snapBmwIhkaTempC(tempC);
+    if (typeof observedRaw === 'number' && observedRaw > 0 && observedRaw <= 28) {
+        return Math.max(0, Math.min(28, Math.round((snapped - 16) * 2)));
     }
-    return Math.round(clamped * 2);
+    return Math.max(32, Math.min(56, Math.round(snapped * 2)));
 }
 
 function createInitialState() {
@@ -234,6 +244,7 @@ class CarController {
             comfortSock: COMFORT_SOCK,
             onStateChange: null,
             onPttEvent: null,
+            shouldFireImmediateShortPress: null,
             onLog: () => {},
         }, opts || {});
         this.state = createInitialState();
@@ -244,6 +255,7 @@ class CarController {
         this.pttDownAt = 0;
         this.pttLongTimer = null;
         this.pttLongFired = false;
+        this.pttImmediateFired = false;
         this.lastPttTapAt = 0;
         this.lastPttDispatchAt = 0;
         this.lastSpeechDialogState = null;
@@ -296,7 +308,15 @@ class CarController {
             this.state.pttPressed = true;
             this.pttDownAt = now;
             this.pttLongFired = false;
+            this.pttImmediateFired = false;
             this.abortNativeSpeechPrompt();
+            if (this.opts.shouldFireImmediateShortPress && this.opts.shouldFireImmediateShortPress()) {
+                this.pttImmediateFired = true;
+                this.lastPttDispatchAt = now;
+                this.emitState();
+                if (this.opts.onPttEvent) this.opts.onPttEvent({ kind: 'short_press', heldMs: 0 });
+                return;
+            }
             if (this.pttLongTimer) clearTimeout(this.pttLongTimer);
             this.pttLongTimer = setTimeout(() => {
                 if (this.state.pttPressed && !this.pttLongFired) {
@@ -313,8 +333,10 @@ class CarController {
                 this.pttLongTimer = null;
             }
             const heldMs = now - this.pttDownAt;
+            const skip = this.pttLongFired || this.pttImmediateFired;
+            this.pttImmediateFired = false;
             this.emitState();
-            if (this.pttLongFired) return;
+            if (skip) return;
             let kind = heldMs >= 620 ? 'long_press' : 'short_press';
             if (kind === 'short_press' && (now - this.lastPttTapAt) < 480) {
                 kind = 'double_press';
@@ -328,8 +350,15 @@ class CarController {
     }
 
     abortNativeSpeechPrompt() {
-        this.callMethodIfAvailable('speechPrompter', 'abortPrompt', {}).catch(() => {});
-        this.callMethodIfAvailable('voicePrompt', 'abort', {}).catch(() => {});
+        const fire = () => {
+            this.callMethodIfAvailable('speechPrompter', 'abortPrompt', {}).catch(() => {});
+            this.callMethodIfAvailable('voicePrompt', 'abort', {}).catch(() => {});
+        };
+        fire();
+        [70, 200, 420].forEach((ms) => {
+            const t = setTimeout(fire, ms);
+            if (t.unref) t.unref();
+        });
     }
 
     applyTpmsStruct(v) {
@@ -379,6 +408,21 @@ class CarController {
         return coerceByDataRef(this.db.datatypes, fd.dataRef, payload, 0);
     }
 
+    coerceMethodArgs(proxyKey, methodName, rawArgs) {
+        if (!this.db || !this.db.datatypes || !this.db.interfaces) return rawArgs || {};
+        const ifaceName = this.proxyIfaceMap[proxyKey];
+        const iv = ifaceName && this.db.interfaces[ifaceName];
+        const md = iv && iv.methods && iv.methods[methodName];
+        if (!md || !Array.isArray(md.inputs)) return rawArgs || {};
+        const src = (rawArgs && typeof rawArgs === 'object') ? rawArgs : {};
+        const out = {};
+        for (let i = 0; i < md.inputs.length; i++) {
+            const inp = md.inputs[i];
+            out[inp.name] = coerceByDataRef(this.db.datatypes, inp.dataRef, src[inp.name], 0);
+        }
+        return out;
+    }
+
     async setFieldIfAvailable(proxyKey, fieldName, payload, timeoutMs) {
         if (!(await this.isProxyAvailable(proxyKey))) return { ok: false, reason: 'unavailable' };
         const px = this.proxies[proxyKey];
@@ -395,8 +439,9 @@ class CarController {
     async callMethodIfAvailable(proxyKey, methodName, payload, timeoutMs) {
         if (!(await this.isProxyAvailable(proxyKey))) return { ok: false, reason: 'unavailable' };
         const px = this.proxies[proxyKey];
+        const coercedArgs = this.coerceMethodArgs(proxyKey, methodName, payload);
         try {
-            const res = await this.nativeTick(() => px.callMethod(methodName, payload || {}, timeoutMs || 2800));
+            const res = await this.nativeTick(() => px.callMethod(methodName, coercedArgs, timeoutMs || 2800));
             return { ok: true, response: res };
         } catch (e) {
             return { ok: false, error: e.message };
@@ -545,17 +590,19 @@ class CarController {
             this.handleSteeringPttSignal(pressed);
         });
 
-        addBinding('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v) => {
+        addBinding('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v, isInitialRead) => {
             if (v === null || v === undefined) return;
             const prev = this.lastSpeechDialogState;
             this.lastSpeechDialogState = v;
+            if (isInitialRead) return;
             const sVal = String(v).toUpperCase();
-            if (prev !== null && prev !== v && (v === 2 || sVal === 'RUNNING')) {
+            const isIdle = (v === 0 || v === 1 || /^(IDLE|NONE|INACTIVE|ABORTED|STOPPED|OFF|0|1)$/.test(sVal));
+            if (!isIdle && prev !== v) {
                 this.abortNativeSpeechPrompt();
                 const now = Date.now();
-                if (!this.state.pttPressed && (now - this.lastPttDispatchAt) > 1500) {
+                if (!this.state.pttPressed && (now - this.lastPttDispatchAt) > 1200) {
                     this.lastPttDispatchAt = now;
-                    if (this.opts.onPttEvent) this.opts.onPttEvent({ kind: 'short_press', heldMs: 120 });
+                    if (this.opts.onPttEvent) this.opts.onPttEvent({ kind: 'short_press', heldMs: 100 });
                 }
             }
         }, 'HMISpeechHU');
@@ -697,14 +744,14 @@ class CarController {
                             try {
                                 return px.subscribe({
                                     name: fname,
-                                    onReceive: (val) => { try { b.onField(fname, val); } catch (e) {} },
+                                    onReceive: (val) => { try { b.onField(fname, val, false); } catch (e) {} },
                                 });
                             } catch (e) { return null; }
                         });
                     }
                     if (flags.indexOf('r') >= 0) {
                         this.nativeTick(() => px.getValue(fname, 2500))
-                            .then((val) => { try { b.onField(fname, val); } catch (e) {} })
+                            .then((val) => { try { b.onField(fname, val, true); } catch (e) {} })
                             .catch(() => {});
                     }
                 }
@@ -781,7 +828,7 @@ class CarController {
                 }
 
                 if (args.tempC !== undefined) {
-                    const tVal = Math.max(16, Math.min(28, +(Math.round(Number(args.tempC) * 2) / 2).toFixed(1)));
+                    const tVal = snapBmwIhkaTempC(args.tempC);
                     const rawByte = encodeSp18TempByte(tVal, this.observedTempRaw);
                     if (opZone === 0) {
                         sp18Front.operationTemperatureTargetDR = rawByte;
@@ -805,13 +852,21 @@ class CarController {
                     args._resolvedTempC = tVal;
                 } else if (args.deltaTempC !== undefined) {
                     const d = Number(args.deltaTempC) || 0;
-                    if (opZone === 2) {
-                        const nextP = Math.max(16, Math.min(28, +(this.state.climate.tempPassengerC + d).toFixed(1)));
+                    if (opZone === 0) {
+                        const nextD = snapBmwIhkaTempC(this.state.climate.tempDriverC + d);
+                        const nextP = snapBmwIhkaTempC(this.state.climate.tempPassengerC + d);
+                        sp18Front.operationTemperatureTargetDR = encodeSp18TempByte(nextD, this.observedTempRaw);
+                        sp18Front.operationTemperatureTargetPS = encodeSp18TempByte(nextP, this.observedTempRaw);
+                        args._resolvedTempDriverC = nextD;
+                        args._resolvedTempPassengerC = nextP;
+                        changes.push('nhiệt độ 2 vùng ' + nextD + '°C');
+                    } else if (opZone === 2) {
+                        const nextP = snapBmwIhkaTempC(this.state.climate.tempPassengerC + d);
                         sp18Front.operationTemperatureTargetPS = encodeSp18TempByte(nextP, this.observedTempRaw);
                         args._resolvedTempPassengerC = nextP;
                         changes.push('điều hoà ghế phụ ' + nextP + '°C');
                     } else {
-                        const nextD = Math.max(16, Math.min(28, +(this.state.climate.tempDriverC + d).toFixed(1)));
+                        const nextD = snapBmwIhkaTempC(this.state.climate.tempDriverC + d);
                         sp18Front.operationTemperatureTargetDR = encodeSp18TempByte(nextD, this.observedTempRaw);
                         args._resolvedTempDriverC = nextD;
                         changes.push('điều hoà ghế tài ' + nextD + '°C');
@@ -893,6 +948,23 @@ class CarController {
                     if (args._resolvedFan !== undefined) this.state.climate.fanLevel = args._resolvedFan;
                     if (args.freshAir !== undefined) this.state.climate.freshAir = !!args.freshAir;
                     if (args.sync !== undefined) this.state.climate.sync = !!args.sync;
+
+                    if (this.state.liveCar && frontTouched && await this.isProxyAvailable('sp18Climate2')) {
+                        await new Promise((r) => setTimeout(r, 180));
+                        try {
+                            const dr = await this.nativeTick(() => this.proxies.sp18Climate2.getValue('statusAirConditionDRStatus', 1200));
+                            if (dr && typeof dr.temperatureTargetDRIHKA === 'number' && dr.temperatureTargetDRIHKA !== 255) {
+                                this.observedTempRaw = dr.temperatureTargetDRIHKA;
+                                const cd = decodeSp18TempByte(dr.temperatureTargetDRIHKA);
+                                if (cd !== null) this.state.climate.tempDriverC = cd;
+                            }
+                            const ps = await this.nativeTick(() => this.proxies.sp18Climate2.getValue('statusAirConditionPSStatus', 1200));
+                            if (ps && typeof ps.temperatureTargetPSIHKA === 'number' && ps.temperatureTargetPSIHKA !== 255) {
+                                const cpv = decodeSp18TempByte(ps.temperatureTargetPSIHKA);
+                                if (cpv !== null) this.state.climate.tempPassengerC = cpv;
+                            }
+                        } catch (e) {}
+                    }
                     this.emitState();
                 }
 
@@ -1257,6 +1329,7 @@ module.exports = {
     OEM_AMBIENT_COLORS,
     resolveAmbientColor,
     coerceByDataRef,
+    snapBmwIhkaTempC,
     decodeSp18TempByte,
     encodeSp18TempByte,
     createInitialState,

@@ -17,8 +17,15 @@ const nop = () => {};
 const qrMatrixCache = new Map();
 const fitCache = new Map();
 
+function cleanText(s) {
+    return String(s || '')
+        .replace(/[\u201c\u201d\u201e\u00ab\u00bb]/g, '"')
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u2014\u2013]/g, '-');
+}
+
 function fit(cv, str, size, o, max) {
-    str = String(str || '');
+    str = cleanText(str);
     if (!str) return '';
     const fk = (o && o.font) || '';
     const key = size + '|' + max + '|' + fk + '|' + str;
@@ -208,10 +215,11 @@ function draw(cv, G, t, v, act) {
     drawOemBox(cv, G, rx, boxY, rw, boxH, boxAccent, 0.065);
 
     const zonePrefix = turn.speakerZone === 'passenger' ? '[GHẾ PHỤ] ' : '';
-    const lineTop = turn.transcript
-        ? (zonePrefix + '“' + turn.transcript + '”')
+    const cleanTr = cleanText(turn.transcript).trim().replace(/^"+|"+$/g, '').trim();
+    const lineTop = cleanTr
+        ? (zonePrefix + '"' + cleanTr + '"')
         : 'Hoạt động trên mọi màn hình (CarPlay / Bản đồ / Menu chính)';
-    const lineMain = (turn.ok && !isIdleMsg ? '✓ ' : '') + (turn.replyVi || 'Nói "Hey BMW" hoặc bấm nút Mic trên vô-lăng.');
+    const lineMain = (turn.ok && !isIdleMsg ? '✓ ' : '') + cleanText(turn.replyVi || 'Nói "Hey BMW" hoặc bấm nút Mic trên vô-lăng.');
 
     cv.text(fit(cv, lineTop, 17, { literal: true, font: 'label' }, rw - 44), rx + 24, boxY + 46, 17, '#93c5fd', { literal: true, font: 'label' });
     cv.text(fit(cv, lineMain, 24, { literal: true, font: 'bold' }, rw - 44), rx + 24, boxY + 102, 24, replyColor, { literal: true, font: 'bold' });

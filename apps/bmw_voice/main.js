@@ -1,10 +1,13 @@
 'use strict';
 /**
- * main.js - Instant Zero-Lag iDrive 7 Entry Point for `bmw_voice` (`v1.1.0`).
+ * main.js - Instant Zero-Lag iDrive 7 Entry Point + Native PTT Auto-Open for `bmw_voice` (`v1.1.1`).
  *
- *   - Pauses `hmi.json` polling completely while app screen is in the background (`0.00%` idle CPU).
- *   - Software-path `lastSoftWords` fast-skip (`0.0%` CPU when screen is steady).
- *   - Instant `<1ms` Unix socket IPC (`/run/bmw-voice/ctl.sock`) with immediate visual feedback.
+ *   1. Subscribes over `/run/bmw-voice/ctl.sock` (`0.00%` idle CPU in background, `<2ms` push latency).
+ *   2. When Steering Wheel Mic (`PTT`) or 2-step `"Hey BMW"` triggers while on another iDrive screen,
+ *      automatically calls `ctx.openApp()` (`ui.rhmi.openEntryState`) to natively dismiss/replace BMW's
+ *      `"Nhập bằng giọng nói không khả dụng"` screen with our sleek BMW Voice Assistant screen, then
+ *      auto-closes (`ctx.closeApp()`) 3.2s after execution to return to the previous screen!
+ *   3. Reports `app_visible` to `bmw-voice` so `IpaOverlay` yields cleanly whenever `MAIN` is visible.
  *
  * Node 8 (ES2017) compatible.
  */
@@ -33,6 +36,30 @@ mgu.run({
         let pendingBaseTurnAt = 0;
         let pendingTurn = null;
 
+        let pushSock = null;
+        let pushBuf = '';
+        let pushRetryTimer = null;
+        let autoOpenedByVoice = false;
+        let autoCloseTimer = null;
+        let reopenGuardTimer = null;
+
+        function clearVoicePopTimers() {
+            if (autoCloseTimer) { clearTimeout(autoCloseTimer); autoCloseTimer = null; }
+            if (reopenGuardTimer) { clearTimeout(reopenGuardTimer); reopenGuardTimer = null; }
+        }
+
+        function isMainVisible() {
+            return !!(ui.isVisible && ui.isVisible('MAIN'));
+        }
+
+        function closeIfAutoOpened() {
+            clearVoicePopTimers();
+            if (autoOpenedByVoice && !showQr) {
+                autoOpenedByVoice = false;
+                if (ctx.closeApp) ctx.closeApp();
+            }
+        }
+
         function applyStatus(s, now) {
             const fresh = (s && typeof s.at === 'number' && Math.abs(now - s.at) < STALE_MS) ? s : null;
             status = fresh;
@@ -49,6 +76,113 @@ mgu.run({
                     pendingState = '';
                     pendingTurn = null;
                 }
+            }
+            if (status && status.car && status.car.callActive && autoOpenedByVoice) {
+                closeIfAutoOpened();
+            }
+        }
+
+        function handleVoiceUiEvent(ev) {
+            if (!ev || ev.event !== 'voice_ui') return;
+            if (ev.state) {
+                const prevUp = !!status;
+                applyStatus(ev.state, Date.now());
+                const sig = JSON.stringify(Object.assign({}, ev.state, { at: 0 }));
+                if (sig !== lastSig || prevUp !== !!status || ev.action !== 'state') {
+                    lastSig = sig;
+                    repaint(true);
+                }
+            }
+
+            if (ev.action === 'open' || ev.action === 'open_result') {
+                clearVoicePopTimers();
+                if (!isMainVisible() && ctx.openApp) {
+                    autoOpenedByVoice = true;
+                    ctx.openApp();
+                    // Re-assert once at +260ms so if HmiMain3D opened "Không khả dụng" slightly after PTT,
+                    // our native RHMI entry replaces it immediately.
+                    reopenGuardTimer = setTimeout(() => {
+                        reopenGuardTimer = null;
+                        if (autoOpenedByVoice && (!isMainVisible() || (ui.hasFocus && !ui.hasFocus('MAIN'))) && ctx.openApp) {
+                            ctx.openApp();
+                        }
+                    }, 260);
+                    if (reopenGuardTimer.unref) reopenGuardTimer.unref();
+                }
+                if (ev.action === 'open_result') {
+                    const hold = Math.max(1500, Number(ev.holdMs) || 3200);
+                    autoCloseTimer = setTimeout(() => {
+                        autoCloseTimer = null;
+                        closeIfAutoOpened();
+                    }, hold);
+                    if (autoCloseTimer.unref) autoCloseTimer.unref();
+                }
+            } else if (ev.action === 'finish') {
+                if (reopenGuardTimer) { clearTimeout(reopenGuardTimer); reopenGuardTimer = null; }
+                if (autoOpenedByVoice && !showQr) {
+                    if (autoCloseTimer) clearTimeout(autoCloseTimer);
+                    const hold = Math.max(1500, Number(ev.holdMs) || 3200);
+                    autoCloseTimer = setTimeout(() => {
+                        autoCloseTimer = null;
+                        closeIfAutoOpened();
+                    }, hold);
+                    if (autoCloseTimer.unref) autoCloseTimer.unref();
+                }
+            }
+        }
+
+        function connectPushStream() {
+            if (pushSock) return;
+            const sockPath = path.join(RUN, 'ctl.sock');
+            let s;
+            try {
+                s = net.createConnection(sockPath);
+            } catch (e) {
+                schedulePushReconnect();
+                return;
+            }
+            pushSock = s;
+            pushBuf = '';
+            s.setEncoding('utf8');
+            s.on('connect', () => {
+                if (s.setNoDelay) s.setNoDelay(true);
+                try {
+                    s.write(JSON.stringify({ id: ++cmdId, cmd: 'subscribe_hmi', arg: { visible: isMainVisible() } }) + '\n');
+                } catch (e) {}
+            });
+            s.on('data', (chunk) => {
+                pushBuf += chunk;
+                let idx;
+                while ((idx = pushBuf.indexOf('\n')) >= 0) {
+                    const line = pushBuf.slice(0, idx).trim();
+                    pushBuf = pushBuf.slice(idx + 1);
+                    if (!line) continue;
+                    try {
+                        handleVoiceUiEvent(JSON.parse(line));
+                    } catch (e) {}
+                }
+            });
+            s.on('error', () => {});
+            s.on('close', () => {
+                if (pushSock === s) pushSock = null;
+                schedulePushReconnect();
+            });
+        }
+
+        function schedulePushReconnect() {
+            if (pushRetryTimer) return;
+            pushRetryTimer = setTimeout(() => {
+                pushRetryTimer = null;
+                connectPushStream();
+            }, 3500);
+            if (pushRetryTimer.unref) pushRetryTimer.unref();
+        }
+
+        function notifyVisibility(vis) {
+            if (pushSock && !pushSock.destroyed) {
+                try {
+                    pushSock.write(JSON.stringify({ id: ++cmdId, cmd: 'app_visible', arg: { visible: !!vis } }) + '\n');
+                } catch (e) {}
             }
         }
 
@@ -91,7 +225,7 @@ mgu.run({
         function syncPollTimer(visible) {
             if (visible) {
                 if (!pollTimer) {
-                    pollTimer = setInterval(pollAsync, 450);
+                    pollTimer = setInterval(pollAsync, 900);
                     if (pollTimer.unref) pollTimer.unref();
                 }
                 pollAsync();
@@ -117,6 +251,12 @@ mgu.run({
 
         function send(cmd, arg) {
             const payload = JSON.stringify({ id: ++cmdId, cmd, arg: arg || {} });
+            if (pushSock && !pushSock.destroyed) {
+                try {
+                    pushSock.write(payload + '\n');
+                    return;
+                } catch (e) {}
+            }
             const sockPath = path.join(RUN, 'ctl.sock');
             try {
                 let sent = false;
@@ -140,6 +280,8 @@ mgu.run({
 
         const acts = {
             triggerMic: () => {
+                autoOpenedByVoice = false;
+                clearVoicePopTimers();
                 if (status && status.settings && !status.settings.hasApiKey) {
                     showQr = true;
                     return repaint(true);
@@ -159,6 +301,8 @@ mgu.run({
                 return repaint(true);
             },
             toggleQr: () => {
+                autoOpenedByVoice = false;
+                clearVoicePopTimers();
                 showQr = !showQr;
                 if (!showQr) userClosedQr = true;
                 return repaint(true);
@@ -226,23 +370,29 @@ mgu.run({
         };
 
         readInitialSync();
+        connectPushStream();
         loop = ctx.loop('MAIN', 2, render);
         if (ctx.onLayout) ctx.onLayout(() => repaint(true));
         if (ui.onVisible) {
             ui.onVisible((name, vis) => {
                 if (name === 'MAIN') {
+                    notifyVisibility(vis);
+                    if (!vis) {
+                        autoOpenedByVoice = false;
+                        clearVoicePopTimers();
+                    }
                     syncPollTimer(vis);
                     if (vis) repaint(true);
                 }
             });
         }
-        syncPollTimer(!ui.isVisible || ui.isVisible('MAIN'));
+        syncPollTimer(isMainVisible());
 
         ['BTN_MIC', 'BTN_QR'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
         ui.onClick('BTN_MIC', acts.triggerMic);
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.1.0 ready');
+        log.info('bmw_voice v1.1.1 ready');
     },
 });

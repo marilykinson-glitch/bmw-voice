@@ -1,9 +1,16 @@
 'use strict';
 /**
- * uplink.js - Non-root HTTPS bridge for `bmw-voice` via MGU Store `mgu-uplink`.
+ * uplink.js - Non-root HTTPS bridge for `bmw-voice` via MGU Store `mgu-uplink` (`v1.1.1`).
  *
- * Prewarms Keep-Alive TLS 1.3 socket to `generativelanguage.googleapis.com` while the driver speaks,
- * and shuts down the helper worker after 90s idle (`0 MB RAM` when idle).
+ * Reliability upgrades for real-car MGU / phone-hotspot networks:
+ *   1. Excludes BMW internal OABR/VLAN ethernet (`160.48.*`), link-local (`169.254.*`), and loopback (`127.*`)
+ *      from DNS candidates so internal head-unit interfaces never return `queryA ECONNREFUSED`.
+ *   2. Always includes `1.1.1.1` & `8.8.8.8` in the primary UDP DNS race pool alongside `lease.dns`.
+ *   3. Automatic DNS-over-HTTPS (DoH) fallback over TCP port 443 (`1.1.1.1` Cloudflare & `8.8.8.8` Google by IP literal)
+ *      whenever UDP port 53 is blocked or `ECONNREFUSED` by a phone hotspot / mobile carrier.
+ *   4. Prewarms Keep-Alive TLS socket while the driver speaks, retries transient network resets once,
+ *      and shuts down the helper worker after 90s idle (`0 MB RAM` when idle).
+ *
  * Node 8 (ES2017) & Node 22 compatible.
  */
 const fs = require('fs');
@@ -35,6 +42,10 @@ const dnsCache = {};
 const sharedHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 4 });
 const insecureHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 2, rejectUnauthorized: false });
 
+function clearDnsCache() {
+    Object.keys(dnsCache).forEach((k) => { delete dnsCache[k]; });
+}
+
 function defaultFetchCmd() {
     if (fs.existsSync(NODE22_BIN)) {
         return [NODE22_BIN, '--max-http-header-size=65536', __filename, '--fetch'];
@@ -61,6 +72,7 @@ function options(over) {
         fetchCmd: defaultFetchCmd(),
         noSetuid: false,
         baseUrl: '',
+        dohEndpoints: null,
         log: () => {},
     }, over || {});
 }
@@ -140,29 +152,151 @@ function pickUid(o) {
     return uid;
 }
 
+function isUsableDnsIp(ip) {
+    if (typeof ip !== 'string' || !/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return false;
+    if (ip === '0.0.0.0' || ip === '255.255.255.255') return false;
+    // Exclude loopback (`127.*`), link-local (`169.254.*`), and BMW MGU internal OABR/VLAN (`160.48.*`)
+    if (/^(?:127\.|169\.254\.|160\.48\.)/.test(ip)) return false;
+    const parts = ip.split('.').map(Number);
+    return parts.every((n) => n >= 0 && n <= 255);
+}
+
 function dnsServers(leaseFile, routeFile) {
     const out = [];
     const add = (ip) => {
-        if (typeof ip === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(ip) && ip !== '0.0.0.0' && !/^127\./.test(ip) && out.indexOf(ip) < 0) out.push(ip);
+        if (isUsableDnsIp(ip) && out.indexOf(ip) < 0) out.push(ip);
     };
     const lease = readJson(leaseFile || '/run/mgu-uplink/lease.json') || {};
     (lease.dns || []).forEach(add);
-    ['/etc/resolv.conf', '/run/connman/resolv.conf', '/var/run/connman/resolv.conf'].forEach((f) => {
+    // Keep public anycast DNS inside the primary race pool so dead local resolvers never starve lookup
+    ['1.1.1.1', '8.8.8.8'].forEach(add);
+    ['/run/connman/resolv.conf', '/var/run/connman/resolv.conf', '/etc/resolv.conf'].forEach((f) => {
         lines(f).forEach((l) => { const m = /^\s*nameserver\s+(\S+)/.exec(l); if (m) add(m[1]); });
     });
-    lines(routeFile || '/proc/net/route').slice(1).map((l) => l.trim().split(/\s+/)).filter((c) => c.length > 7 && c[1] === '00000000').forEach((c) => {
-        const g = parseInt(c[2], 16);
-        if (isFinite(g)) add([g & 255, (g >>> 8) & 255, (g >>> 16) & 255, (g >>> 24) & 255].join('.'));
-    });
-    ['1.1.1.1', '8.8.8.8'].forEach(add);
+    lines(routeFile || '/proc/net/route').slice(1)
+        .map((l) => l.trim().split(/\s+/))
+        .filter((c) => c.length > 7 && c[1] === '00000000' && c[7] === '00000000')
+        .forEach((c) => {
+            const g = parseInt(c[2], 16);
+            if (isFinite(g)) add([g & 255, (g >>> 8) & 255, (g >>> 16) & 255, (g >>> 24) & 255].join('.'));
+        });
     return out;
 }
 
-function customLookup(leaseFile, routeFile, preResolvedServers) {
+const DEFAULT_DOH_ENDPOINTS = [
+    { proto: 'https', ip: '1.1.1.1', port: 443, servername: 'cloudflare-dns.com', hostHeader: 'cloudflare-dns.com', pathPrefix: '/dns-query' },
+    { proto: 'https', ip: '8.8.8.8', port: 443, servername: 'dns.google', hostHeader: 'dns.google', pathPrefix: '/resolve' },
+];
+
+function querySingleDoh(ep, host, timeoutMs, strictTls) {
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const fin = (err, ips) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (err) reject(err);
+            else resolve(ips);
+        };
+        const isHttp = ep.proto === 'http';
+        const transport = isHttp ? http : https;
+        const qPath = ep.pathPrefix + '?name=' + encodeURIComponent(host) + '&type=A';
+        const reqOpts = {
+            host: ep.ip,
+            port: ep.port || (isHttp ? 80 : 443),
+            path: qPath,
+            method: 'GET',
+            headers: {
+                Host: ep.hostHeader || ep.ip,
+                Accept: 'application/dns-json',
+                'User-Agent': 'bmw-voice/1.1',
+                Connection: 'keep-alive',
+            },
+        };
+        if (!isHttp) {
+            reqOpts.servername = ep.servername || ep.hostHeader || ep.ip;
+            reqOpts.family = 4;
+            reqOpts.rejectUnauthorized = strictTls !== false;
+            reqOpts.agent = strictTls !== false ? sharedHttpsAgent : insecureHttpsAgent;
+        }
+        const req = transport.request(reqOpts, (res) => {
+            const chunks = [];
+            let sz = 0;
+            res.on('data', (c) => {
+                sz += c.length;
+                if (sz > 65536) { req.abort(); fin(new Error('DoH response too large')); return; }
+                chunks.push(c);
+            });
+            res.on('end', () => {
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    return fin(new Error('DoH HTTP ' + res.statusCode));
+                }
+                try {
+                    const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                    const ans = Array.isArray(j && j.Answer) ? j.Answer : [];
+                    const ips = [];
+                    for (let i = 0; i < ans.length; i++) {
+                        const a = ans[i];
+                        if (a && (a.type === 1 || a.type === 'A') && typeof a.data === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(a.data)) {
+                            if (ips.indexOf(a.data) < 0) ips.push(a.data);
+                        }
+                    }
+                    if (!ips.length) return fin(new Error('DoH no A record'));
+                    fin(null, ips);
+                } catch (e) {
+                    fin(e);
+                }
+            });
+            res.on('error', fin);
+        });
+        const timer = setTimeout(() => { try { req.abort(); } catch (e) {} fin(new Error('DoH timeout')); }, timeoutMs || 2400);
+        req.on('error', (err) => {
+            const msg = String((err && err.code) || '') + ' ' + String((err && err.message) || '');
+            if (!isHttp && strictTls !== false && /CERT|TLS|SSL|UNABLE_TO_VERIFY|SELF_SIGNED/i.test(msg)) {
+                done = true;
+                clearTimeout(timer);
+                querySingleDoh(ep, host, timeoutMs, false).then(resolve, reject);
+                return;
+            }
+            fin(err);
+        });
+        req.end();
+    });
+}
+
+function resolveViaDoh(host, dohEndpoints, timeoutMs) {
+    const eps = Array.isArray(dohEndpoints) && dohEndpoints.length ? dohEndpoints : DEFAULT_DOH_ENDPOINTS;
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let pending = eps.length;
+        let lastErr = null;
+        eps.forEach((ep) => {
+            querySingleDoh(ep, host, timeoutMs || 2400, true).then(
+                (ips) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(ips);
+                },
+                (err) => {
+                    lastErr = err || lastErr;
+                    pending--;
+                    if (!settled && pending <= 0) {
+                        settled = true;
+                        reject(lastErr || new Error('DoH failed for ' + host));
+                    }
+                }
+            );
+        });
+    });
+}
+
+function customLookup(leaseFile, routeFile, preResolvedServers, dohEndpoints) {
     const servers = Array.isArray(preResolvedServers) && preResolvedServers.length
-        ? preResolvedServers
+        ? preResolvedServers.filter(isUsableDnsIp)
         : dnsServers(leaseFile, routeFile);
-    if (!servers.length) return undefined;
+    if (!servers.length) {
+        servers.push('1.1.1.1', '8.8.8.8');
+    }
     return function (host, opts, cb) {
         if (typeof opts === 'function') {
             cb = opts;
@@ -183,11 +317,27 @@ function customLookup(leaseFile, routeFile, preResolvedServers) {
             return deliver(cached.ips);
         }
 
-        const pool = servers.slice(0, 4);
+        const pool = servers.slice(0, 5);
         let settled = false;
         let pending = pool.length;
         let lastErr = null;
         const timers = [];
+
+        const tryDohFallback = () => {
+            if (dohEndpoints === false) {
+                cb(lastErr || new Error('DNS failed for ' + host));
+                return;
+            }
+            resolveViaDoh(host, dohEndpoints, 2500).then(
+                (ips) => {
+                    dnsCache[host] = { ips, expiresAt: Date.now() + 600000 };
+                    deliver(ips);
+                },
+                () => {
+                    cb(lastErr || new Error('DNS failed for ' + host));
+                }
+            );
+        };
 
         const finishErr = (err) => {
             lastErr = err || lastErr;
@@ -195,7 +345,7 @@ function customLookup(leaseFile, routeFile, preResolvedServers) {
             if (!settled && pending <= 0) {
                 settled = true;
                 timers.forEach(clearTimeout);
-                cb(lastErr || new Error('DNS failed for ' + host));
+                tryDohFallback();
             }
         };
 
@@ -210,7 +360,7 @@ function customLookup(leaseFile, routeFile, preResolvedServers) {
                         localDone = true;
                         finishErr(new Error('DNS timeout'));
                     }
-                }, 1800);
+                }, 1600);
                 timers.push(t);
                 r.resolve4(host, (err, ips) => {
                     if (localDone || settled) return;
@@ -219,12 +369,12 @@ function customLookup(leaseFile, routeFile, preResolvedServers) {
                     if (err || !ips || !ips.length) return finishErr(err || new Error('no A record'));
                     settled = true;
                     timers.forEach(clearTimeout);
-                    dnsCache[host] = { ips, expiresAt: Date.now() + 300000 };
+                    dnsCache[host] = { ips, expiresAt: Date.now() + 600000 };
                     deliver(ips);
                 });
             };
-            if (idx < 2) launch();
-            else timers.push(setTimeout(launch, 65));
+            if (idx < 3) launch();
+            else timers.push(setTimeout(launch, 55));
         });
     };
 }
@@ -234,7 +384,7 @@ function doHttp(q, lookup, strictTls) {
         let done = false, size = 0;
         const finish = (e, v) => { if (done) return; done = true; clearTimeout(timer); e ? reject(e) : resolve(v); };
         const bodyBuf = q.bodyBase64 ? Buffer.from(q.bodyBase64, 'base64') : (q.body ? Buffer.from(String(q.body), 'utf8') : null);
-        const headers = Object.assign({ 'User-Agent': 'bmw-voice/1.0', Accept: 'application/json', Connection: 'keep-alive' }, q.headers || {});
+        const headers = Object.assign({ 'User-Agent': 'bmw-voice/1.1', Accept: 'application/json', Connection: 'keep-alive' }, q.headers || {});
         if (bodyBuf) headers['Content-Length'] = bodyBuf.length;
 
         let transport = https;
@@ -285,10 +435,19 @@ function doHttp(q, lookup, strictTls) {
 }
 
 function doHttpWithTlsFallback(q, lookup) {
-    return doHttp(q, lookup, true).catch((err) => {
+    const attempt = () => doHttp(q, lookup, true).catch((err) => {
         const msg = String((err && err.code) || '') + ' ' + String((err && err.message) || '');
         if (/CERT|TLS|SSL|UNABLE_TO_VERIFY|SELF_SIGNED/i.test(msg) && !q.baseUrl) {
             return doHttp(q, lookup, false);
+        }
+        throw err;
+    });
+
+    return attempt().catch((err) => {
+        const msg = String((err && err.code) || '') + ' ' + String((err && err.message) || '');
+        if (!q.baseUrl && /ECONNREFUSED|ECONNRESET|EPIPE|EAI_AGAIN|ENETUNREACH|DNS/i.test(msg)) {
+            if (q.host) delete dnsCache[q.host];
+            return new Promise((r) => setTimeout(r, 150)).then(attempt);
         }
         throw err;
     });
@@ -306,7 +465,7 @@ function prewarmHost(host, lookup) {
             autoSelectFamily: false,
             path: '/',
             method: 'HEAD',
-            headers: { Connection: 'keep-alive', 'User-Agent': 'bmw-voice/1.0' },
+            headers: { Connection: 'keep-alive', 'User-Agent': 'bmw-voice/1.1' },
             lookup,
             agent: sharedHttpsAgent,
         }, (res) => {
@@ -406,7 +565,7 @@ function request(o, reqSpec) {
     }
     const uid = pickUid(o);
     if (uid === null || o.noSetuid) {
-        return doHttpWithTlsFallback(reqSpec, customLookup(o.lease, o.route));
+        return doHttpWithTlsFallback(reqSpec, customLookup(o.lease, o.route, undefined, o.dohEndpoints));
     }
     const worker = ensurePersistentWorker(o, uid);
     if (!worker) {
@@ -420,7 +579,7 @@ function request(o, reqSpec) {
                 delete worker.pending[id];
                 reject(new Error('uplink timeout'));
             }
-        }, (reqSpec.timeoutMs || 18000) + 2000);
+        }, (reqSpec.timeoutMs || 18000) + 2500);
         worker.pending[id] = {
             timer,
             resolve: (r) => resolve({
@@ -430,7 +589,12 @@ function request(o, reqSpec) {
             reject,
         };
         const servers = dnsServers(o.lease, o.route);
-        const payload = Object.assign({}, reqSpec, { lease: o.lease, route: o.route, dns: servers });
+        const payload = Object.assign({}, reqSpec, {
+            lease: o.lease,
+            route: o.route,
+            dns: servers,
+            dohEndpoints: o.dohEndpoints || null,
+        });
         try {
             worker.child.stdin.write(JSON.stringify({ id, q: payload }) + '\n');
         } catch (e) {
@@ -446,7 +610,7 @@ function warmup(o) {
     if (!o || o.baseUrl) return Promise.resolve(false);
     const uid = pickUid(o);
     if (uid === null || o.noSetuid) {
-        const lk = customLookup(o.lease, o.route);
+        const lk = customLookup(o.lease, o.route, undefined, o.dohEndpoints);
         return Promise.all(listHosts.map((h) => prewarmHost(h, lk))).then(() => true, () => false);
     }
     const worker = ensurePersistentWorker(o, uid);
@@ -465,7 +629,14 @@ function warmup(o) {
         };
         const servers = dnsServers(o.lease, o.route);
         try {
-            worker.child.stdin.write(JSON.stringify({ id, warmup: listHosts, lease: o.lease, route: o.route, dns: servers }) + '\n');
+            worker.child.stdin.write(JSON.stringify({
+                id,
+                warmup: listHosts,
+                lease: o.lease,
+                route: o.route,
+                dns: servers,
+                dohEndpoints: o.dohEndpoints || null,
+            }) + '\n');
         } catch (e) {
             clearTimeout(timer);
             delete worker.pending[id];
@@ -501,7 +672,7 @@ if (require.main === module && process.argv[2] === '--worker') {
             const id = msg && msg.id;
             if (!id) continue;
             if (Array.isArray(msg.warmup)) {
-                const lk = customLookup(msg.lease, msg.route, msg.dns);
+                const lk = customLookup(msg.lease, msg.route, msg.dns, msg.dohEndpoints);
                 Promise.all(msg.warmup.map((h) => prewarmHost(h, lk)))
                     .then(
                         () => process.stdout.write(JSON.stringify({ id, res: { ok: true } }) + '\n'),
@@ -514,7 +685,7 @@ if (require.main === module && process.argv[2] === '--worker') {
                 process.stdout.write(JSON.stringify({ id, error: 'bad host/path' }) + '\n');
                 continue;
             }
-            doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns))
+            doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns, q.dohEndpoints))
                 .then(
                     (res) => process.stdout.write(JSON.stringify({ id, res }) + '\n'),
                     (e) => process.stdout.write(JSON.stringify({ id, error: e.code ? e.code + ' ' + e.message : e.message }) + '\n')
@@ -532,7 +703,7 @@ if (require.main === module && process.argv[2] === '--worker') {
         let q;
         try { q = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return out({ error: 'bad request' }); }
         if (!/^[a-z0-9.-]+$/i.test(String(q.host)) || String(q.path).charAt(0) !== '/') return out({ error: 'bad host/path' });
-        doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns))
+        doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns, q.dohEndpoints))
             .then(out, (e) => out({ error: e.code ? e.code + ' ' + e.message : e.message }));
     });
 }
@@ -541,6 +712,10 @@ module.exports = {
     SELF,
     options,
     pickUid,
+    isUsableDnsIp,
+    dnsServers,
+    resolveViaDoh,
+    clearDnsCache,
     customLookup,
     request,
     warmup,

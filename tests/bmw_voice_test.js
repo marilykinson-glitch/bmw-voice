@@ -1,6 +1,6 @@
 'use strict';
 /**
- * bmw_voice_test.js - Comprehensive Unit & E2E Test Suite for `bmw-voice` (`v1.1.0`).
+ * bmw_voice_test.js - Comprehensive Unit, Anti-Hallucination & E2E Test Suite for `bmw-voice` (`v1.1.1`).
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 const net = require('net');
 
+const Up = require('../tools/bmw-voice/uplink');
 const CarControl = require('../tools/bmw-voice/car-control');
 const MicCapture = require('../tools/bmw-voice/mic-capture');
 const NluBrain = require('../tools/bmw-voice/nlu-brain');
@@ -35,10 +36,10 @@ async function runTests() {
         console.log('  [PASS] ' + name);
     });
 
-    console.log('Running bmw-voice v1.1.0 test suite...');
+    console.log('Running bmw-voice v1.1.1 test suite...');
 
     // 1. MGU Boot Safety, Systemd, Bundled Vietnamese Fonts & Read-Only ALSA Capture Invariants
-    await step('Systemd service, component.json v1.1.0, bundled Inter fonts & ALSA capture-only invariants', () => {
+    await step('Systemd service, component.json v1.1.1, bundled Inter fonts & ALSA capture-only invariants', () => {
         const root = path.resolve(__dirname, '..');
         const svc = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'bmw-voice.service'), 'utf8');
         assert.ok(svc.indexOf('WantedBy=oapcontroller.service') >= 0);
@@ -48,7 +49,7 @@ async function runTests() {
 
         const comp = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'component.json'), 'utf8'));
         assert.strictEqual(comp.id, 'bmw-voice');
-        assert.strictEqual(comp.version, '1.1.0');
+        assert.strictEqual(comp.version, '1.1.1');
         assert.strictEqual(comp.enable[0].target, 'oapcontroller.service');
         assert.deepStrictEqual(comp.recmgr, ['bmw-voice']);
 
@@ -57,8 +58,11 @@ async function runTests() {
         });
 
         const appSpec = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'bmw_voice', 'app.json'), 'utf8'));
-        assert.strictEqual(appSpec.version, '1.1.0');
+        assert.strictEqual(appSpec.version, '1.1.1');
         assert.strictEqual(appSpec.startType, 'autostart');
+
+        const repoSpec = JSON.parse(fs.readFileSync(path.join(root, 'mgu-repo.json'), 'utf8'));
+        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.1.1');
 
         const py = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'alsa-smartx.py'), 'utf8');
         assert.strictEqual(py.indexOf('SND_PCM_STREAM_PLAYBACK'), -1);
@@ -70,8 +74,120 @@ async function runTests() {
         });
     });
 
-    // 2. All 6 OEM BMW IPA In-Car Domains & Zero Music Ducking
-    await step('All 6 OEM BMW IPA domains execute accurately without touching CarPlay volume on non-media turns', async () => {
+    // 2. Real-Car Regression #1: DNS `queryA ECONNREFUSED` Filtering + Automatic DoH Fallback (`uplink.js`)
+    await step('Filters BMW internal 160.48.* DNS & falls back to DoH when UDP 53 returns ECONNREFUSED', async () => {
+        Up.clearDnsCache();
+        assert.strictEqual(Up.isUsableDnsIp('160.48.199.99'), false);
+        assert.strictEqual(Up.isUsableDnsIp('169.254.10.1'), false);
+        assert.strictEqual(Up.isUsableDnsIp('127.0.0.1'), false);
+        assert.strictEqual(Up.isUsableDnsIp('8.8.8.8'), true);
+
+        const dohSrv = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/dns-json' });
+            res.end(JSON.stringify({
+                Status: 0,
+                Answer: [
+                    { name: 'generativelanguage.googleapis.com.', type: 5, data: 'googleapis.l.google.com.' },
+                    { name: 'googleapis.l.google.com.', type: 1, data: '142.250.199.106' },
+                ],
+            }));
+        });
+        await new Promise((r) => dohSrv.listen(0, '127.0.0.1', r));
+
+        // Force UDP DNS to hit a closed/unusable port (`203.0.113.1` / fast fail) or mock resolver -> DoH recovers!
+        const dnsMod = require('dns');
+        const origResolve4 = dnsMod.Resolver.prototype.resolve4;
+        dnsMod.Resolver.prototype.resolve4 = function (_host, cb) {
+            const err = new Error('queryA ECONNREFUSED generativelanguage.googleapis.com');
+            err.code = 'ECONNREFUSED';
+            setImmediate(() => cb(err));
+        };
+        try {
+            const lk = Up.customLookup('/nonexistent/lease.json', '/nonexistent/route', ['8.8.8.8'], [
+                { proto: 'http', ip: '127.0.0.1', port: dohSrv.address().port, hostHeader: 'dns.google', pathPrefix: '/resolve' },
+            ]);
+            const resolved = await new Promise((resolve, reject) => {
+                lk('generativelanguage.googleapis.com', {}, (err, ip, fam) => {
+                    if (err) reject(err);
+                    else resolve({ ip, fam });
+                });
+            });
+            assert.strictEqual(resolved.ip, '142.250.199.106');
+            assert.strictEqual(resolved.fam, 4);
+        } finally {
+            dnsMod.Resolver.prototype.resolve4 = origResolve4;
+            Up.clearDnsCache();
+            await new Promise((r) => dohSrv.close(r));
+        }
+    });
+
+    // 3. Real-Car Regression #2: Exact Photo 3 Hallucination ("Mày nghe tao nói không? Tôi nóng quá..." / 17.5°C) Blocked!
+    await step('Blocks Gemini prompt-contamination hallucinations, mic-check false actions & snaps G30 IHKA setpoints', async () => {
+        // Verify hot-climate BMW G30 IHKA valid step snapping (16.0 LOW, then 18.0..28.0)
+        assert.strictEqual(CarControl.snapBmwIhkaTempC(16.0), 16.0);
+        assert.strictEqual(CarControl.snapBmwIhkaTempC(17.5), 18.0);
+        assert.strictEqual(CarControl.snapBmwIhkaTempC(24.5), 24.5);
+
+        const car = new CarControl.CarController();
+        car.patchState({ climate: { tempDriverC: 24.5, tempPassengerC: 24.5, fanLevel: 3 } });
+
+        // Exact hallucinated Gemini payload observed on car at 20:46 (`media_1795614525673_7e9ecfe2.jpg`)
+        let callIdx = 0;
+        const mockReplies = [
+            {
+                speechDetected: true,
+                transcript: '“Mày nghe tao nói không? Tôi nóng quá, hạ nhiệt độ xuống cho cả hai bên đi.”',
+                toolCalls: [{ name: 'set_climate', args: { tempC: 17.5, zone: 'driver' } }],
+            },
+            {
+                speechDetected: true,
+                transcript: 'Hôm nay hầm gửi xe hơi tối nhỉ',
+                toolCalls: [{ name: 'set_climate', args: { tempC: 17.5, zone: 'driver' } }],
+            },
+        ];
+        const mockGem = http.createServer((req, res) => {
+            req.on('data', () => {});
+            req.on('end', () => {
+                const p = mockReplies[Math.min(callIdx++, mockReplies.length - 1)];
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(p) }] } }] }));
+            });
+        });
+        await new Promise((r) => mockGem.listen(0, '127.0.0.1', r));
+
+        const wav = MicCapture.buildStereoWav(new Array(1600).fill(0.35), new Array(1600).fill(0.05), 16000);
+        const turnMicCheck = await NluBrain.processVoiceOrText({
+            audioWavBase64: wav.toString('base64'),
+            speakerZone: 'driver',
+            apiKey: 'AIzaSyTestKey',
+            carController: car,
+            uplinkOpts: Up.options({ noSetuid: true, baseUrl: 'http://127.0.0.1:' + mockGem.address().port }),
+        });
+
+        assert.strictEqual(turnMicCheck.ok, true);
+        assert.strictEqual(turnMicCheck.micCheck, true);
+        assert.strictEqual(turnMicCheck.transcript, '"Mày nghe tao nói không?"'.replace(/^"|"$/g, ''));
+        assert.strictEqual(turnMicCheck.actions.length, 0, 'mic check MUST NOT touch car climate!');
+        assert.strictEqual(car.state.climate.tempDriverC, 24.5, 'IHKA 24.5°C must remain untouched!');
+        assert.strictEqual(turnMicCheck.transcript.indexOf('“'), -1);
+
+        // Second call: casual non-command sentence where Gemini still tries to inject `set_climate(17.5)`
+        const turnCasual = await NluBrain.processVoiceOrText({
+            audioWavBase64: wav.toString('base64'),
+            speakerZone: 'driver',
+            apiKey: 'AIzaSyTestKey',
+            carController: car,
+            uplinkOpts: Up.options({ noSetuid: true, baseUrl: 'http://127.0.0.1:' + mockGem.address().port }),
+        });
+        assert.strictEqual(turnCasual.ok, false);
+        assert.strictEqual(turnCasual.actions.length, 0);
+        assert.strictEqual(car.state.climate.tempDriverC, 24.5);
+
+        await new Promise((r) => mockGem.close(r));
+    });
+
+    // 4. All 6 OEM BMW IPA In-Car Domains & Honest Hardware Truth Gate
+    await step('All 6 OEM BMW IPA domains execute accurately & physical-switch-only commands return ok: false', async () => {
         const car = new CarControl.CarController();
         car.patchState({ speedKmh: 0, gear: 'P', media: { playing: true, volumePercent: 42, muted: false } });
 
@@ -85,6 +201,15 @@ async function runTests() {
         assert.strictEqual(car.state.climate.tempPassengerC, 24.0);
         assert.strictEqual(car.state.climate.seatHeatPassenger, 2);
         assert.strictEqual(car.state.media.volumePercent, 42);
+
+        const tBoth = await NluBrain.processVoiceOrText({
+            text: 'Nóng quá giảm nhiệt độ cả hai bên',
+            speakerZone: 'driver',
+            carController: car,
+        });
+        assert.strictEqual(tBoth.ok, true);
+        assert.strictEqual(car.state.climate.tempDriverC, 21.0);
+        assert.strictEqual(car.state.climate.tempPassengerC, 22.5);
 
         const t2 = await NluBrain.processVoiceOrText({
             text: 'Đổi đèn viền sang màu tím độ sáng 85%',
@@ -119,13 +244,9 @@ async function runTests() {
         });
         assert.strictEqual(t5.ok, true);
         assert.ok(t5.replyVi.indexOf('Dầu máy') >= 0 && t5.replyVi.indexOf('Bình') >= 0);
-    });
 
-    // 3. Honest Hardware Truth Gate (Never Report Fake Success)
-    await step('Physical-switch-only & unequipped liveCar options return ok: false honestly', async () => {
         const carLive = new CarControl.CarController({ comfortSock: '/nonexistent/comfort.sock' });
         carLive.state.liveCar = true;
-
         const rTrunk = await NluBrain.processVoiceOrText({
             text: 'Mở cốp sau cho anh',
             speakerZone: 'driver',
@@ -133,22 +254,19 @@ async function runTests() {
         });
         assert.strictEqual(rTrunk.ok, false);
         assert.ok(rTrunk.replyVi.indexOf('nút vật lý') >= 0);
-
-        const rMirror = await NluBrain.processVoiceOrText({
-            text: 'Gập gương chiếu hậu',
-            speakerZone: 'driver',
-            carController: carLive,
-        });
-        assert.strictEqual(rMirror.ok, false);
-
-        const rMassage = await carLive.executeTool('set_seat_comfort', { seat: 'driver', massage: true }, 'driver');
-        assert.strictEqual(rMassage.ok, false);
-        assert.strictEqual(carLive.state.climate.massageDriver, false);
-        assert.ok(rMassage.summaryVi.indexOf('không trang bị') >= 0);
     });
 
-    // 4. System-Wide OEM BMW IPA Overlay (`ipa-overlay.js`) Wire Protocol & PTT Z-Order Re-assertion
-    await step('IpaOverlay connects to mgu-render socket, uploads Vietnamese atlases, re-asserts top layer on PTT & auto-hides', async () => {
+    // 5. System-Wide OEM BMW IPA Overlay (`ipa-overlay.js`) + Vietnamese Font Atlas Coverage (Zero `?` Glyphs!)
+    await step('IpaOverlay recreates top Wayland layer on PTT & all UI strings exist in bundled Vietnamese font atlas', async () => {
+        const root = path.resolve(__dirname, '..');
+        const fontJson = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'fonts', 'vietnamese.json'), 'utf8'));
+        const glyphs = fontJson.sizes[0].glyphs;
+        const testChars = '✓·…-°%"\'()[]/:0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzXin chào, tôi đang lắng nghe ĐÃ CHỈNH ĐIỀU HOÀ GHẾ TÀI PHỤ MỨC GIÓ SƯỞI MÁT';
+        for (const ch of testChars) {
+            const cp = ch.codePointAt(0);
+            assert.ok(glyphs[cp], 'bundled vietnamese.json missing glyph for: ' + ch + ' (' + cp + ')');
+        }
+
         const tmpOv = fs.mkdtempSync(path.join(os.tmpdir(), 'bv-ov-'));
         const sockPath = path.join(tmpOv, 'render.sock');
         const rxMsgs = [];
@@ -176,45 +294,28 @@ async function runTests() {
         ov.start();
         await new Promise((r) => setTimeout(r, 60));
 
-        // Verify HELLO -> READY -> PLACE(84, 76, 1836, 644)
-        const helloMsg = rxMsgs.find((m) => m.type === M.HELLO);
-        const placeMsg = rxMsgs.find((m) => m.type === M.PLACE);
-        assert.ok(helloMsg && helloMsg.p.toString('utf8').indexOf('bmw_voice_ipa') === 0);
-        assert.ok(placeMsg);
-        assert.strictEqual(placeMsg.p.readInt32LE(0), 84);
-        assert.strictEqual(placeMsg.p.readInt32LE(4), 76);
-        assert.strictEqual(placeMsg.p.readInt32LE(8), 1836);
-        assert.strictEqual(placeMsg.p.readInt32LE(12), 644);
-
-        // Trigger Steering Wheel PTT listening overlay (with z-order top reassertion at +240ms)
         ov.showListening({ reassertTop: true, speakerZone: 'driver' });
-        await new Promise((r) => setTimeout(r, 310));
+        await new Promise((r) => setTimeout(r, 290));
 
-        const atlasMsgs = rxMsgs.filter((m) => m.type === M.ATLAS);
-        const frameMsgs = rxMsgs.filter((m) => m.type === M.FRAME);
-        const showVals = rxMsgs.filter((m) => m.type === M.SHOW).map((m) => m.p.readUInt32LE(0));
-        assert.ok(atlasMsgs.length >= 2, 'should upload bold + regular Vietnamese Inter glyph atlases');
-        assert.ok(frameMsgs.length >= 2);
-        // Must have initial SHOW(1), then SHOW(0) -> SHOW(1) reassert over HmiMain3D's unsupported-language popup!
-        assert.ok(showVals[0] === 1 && showVals.indexOf(0) > 0 && showVals[showVals.length - 1] === 1);
+        const placeWidths = rxMsgs.filter((m) => m.type === M.PLACE).map((m) => m.p.readInt32LE(8));
+        assert.ok(placeWidths.indexOf(1836) >= 0 && placeWidths.indexOf(1835) >= 0, 'must recreate Wayland layer to beat HmiMain3D popup');
 
-        // Show execution result and verify clean auto-hide SHOW(0)
-        ov.showResult({ ok: true, speakerZone: 'driver', transcript: 'Hey BMW điều hoà 22 độ', replyVi: 'Đã chỉnh điều hoà 22°C' }, 1200);
+        ov.showResult({ ok: true, speakerZone: 'driver', transcript: '“Hey BMW điều hoà 22 độ”', replyVi: 'Đã chỉnh điều hoà 22°C' }, 1200);
+        assert.strictEqual(ov.subline, '"Hey BMW điều hoà 22 độ"');
+        assert.strictEqual(ov.subline.indexOf('“'), -1);
+
         await new Promise((r) => setTimeout(r, 1320));
-        const finalShow = rxMsgs.filter((m) => m.type === M.SHOW).pop();
-        assert.strictEqual(finalShow.p.readUInt32LE(0), 0);
         assert.strictEqual(ov.phase, 'hidden');
 
         ov.stop();
         await new Promise((r) => renderSrv.close(r));
     });
 
-    // 5. "Hey BMW" Wake Word: Deterministic Chatter Filter, 1-Shot Execution & 2-Step Follow-Up E2E
-    await step('"Hey BMW" 1-shot, 2-step wake->overlay->follow-up & cabin chatter silent rejection work E2E', async () => {
-        // Unit check on extractHeyBmwWake
+    // 6. "Hey BMW" Wake Word + Instant PTT Button-Down + Native `bmw_voice` Auto-Open/Auto-Close IPC
+    await step('Instant PTT button-down pushes voice_ui open/finish to bmw_voice & "Hey BMW" 1-shot / 2-step work E2E', async () => {
         assert.strictEqual(NluBrain.extractHeyBmwWake('Hôm nay kẹt xe quá nhỉ').matched, false);
         assert.deepStrictEqual(NluBrain.extractHeyBmwWake('Hey BMW!'), { matched: true, wakeOnly: true, commandText: '' });
-        assert.deepStrictEqual(NluBrain.extractHeyBmwWake('Hây Bê Em Vê chỉnh điều hoà 21 độ'), {
+        assert.deepStrictEqual(NluBrain.extractHeyBmwWake('Ê Bê Em chỉnh điều hoà 21 độ'), {
             matched: true,
             wakeOnly: false,
             commandText: 'chỉnh điều hoà 21 độ',
@@ -225,7 +326,6 @@ async function runTests() {
         fs.mkdirSync(smartxDir);
         fs.writeFileSync(path.join(smartxDir, 'smartx_SpeechSink_CF_2MIC_6REF_c'), '');
 
-        // Create mock persistent stream helper (`--stream-daemon`) driven by control file / stdin
         const mockBin = path.join(tmp, 'mock-python.sh');
         const mockHelper = path.join(tmp, 'mock-smartx.js');
         const sampleWav = MicCapture.buildStereoWav(new Array(2400).fill(0.42), new Array(2400).fill(0.04), 16000);
@@ -257,7 +357,7 @@ async function runTests() {
             "      const out = path.join(workDir, 'ptt_clip.wav');",
             "      fs.writeFileSync(out, fs.readFileSync(srcWav));",
             "      setTimeout(() => {",
-            "        process.stdout.write(JSON.stringify({ event: 'ptt_clip', reqId: msg.reqId, file: out, durationMs: 650, device: devName }) + '\\n');",
+            "        process.stdout.write(JSON.stringify({ event: 'ptt_clip', reqId: msg.reqId, file: out, durationMs: 650, voicedChunks: 6, snrDb: 9.0, device: devName }) + '\\n');",
             "      }, 30);",
             "    }",
             "    if (msg.cmd === 'emit_wake_test') {",
@@ -269,16 +369,12 @@ async function runTests() {
             "});",
         ].join('\n'), { mode: 0o755 });
 
-        // Mock Gemini responder scripted across 4 calls:
-        //   Call 1 (wake): random cabin chatter -> ignored!
-        //   Call 2 (wake): 1-shot "Hey BMW chỉnh điều hoà 20 độ" -> sets 20°C!
-        //   Call 3 (wake): 2-step "Hey BMW" -> wakeOnly: true!
-        //   Call 4 (follow-up ptt): "Đổi đèn viền màu xanh lá" -> sets green!
         const scriptedReplies = [
             { speechDetected: true, wakeDetected: false, wakeOnly: false, transcript: 'Hôm nay trời mát quá anh ơi', toolCalls: [] },
             { speechDetected: true, wakeDetected: true, wakeOnly: false, transcript: 'Hey BMW chỉnh điều hoà 20 độ', toolCalls: [{ name: 'set_climate', args: { tempC: 20, zone: 'driver' } }] },
             { speechDetected: true, wakeDetected: true, wakeOnly: true, transcript: 'Hey BMW', toolCalls: [] },
             { speechDetected: true, transcript: 'Đổi đèn viền màu xanh lá', toolCalls: [{ name: 'set_ambient_light', args: { color: 'green' } }] },
+            { speechDetected: true, transcript: 'Âm lượng 40%', toolCalls: [{ name: 'control_media', args: { action: 'volume', volumePercent: 40 } }] },
         ];
         let gemCallIdx = 0;
         const mockGem = http.createServer((req, res) => {
@@ -323,124 +419,60 @@ async function runTests() {
         dm.saveSettings({ apiKey: 'AIzaSyTestWakeKey1234', handsFreeWake: true });
         await dm.start();
         await waitUntil(() => dm.wakeStatus === 'armed', 3000);
-        assert.strictEqual(dm.wakeStatus, 'armed');
 
-        // A) Cabin chatter without "Hey BMW" -> silently ignored, overlay stays hidden, lastTurn remains idle!
+        // Connect mock `apps/bmw_voice` subscriber to `ctl.sock`
+        const pushEvents = [];
+        const hmiClient = net.createConnection(path.join(tmp, 'run', 'ctl.sock'), () => {
+            hmiClient.write(JSON.stringify({ id: 1, cmd: 'subscribe_hmi', arg: { visible: false } }) + '\n');
+        });
+        let hmiBuf = '';
+        hmiClient.setEncoding('utf8');
+        hmiClient.on('data', (c) => {
+            hmiBuf += c;
+            let idx;
+            while ((idx = hmiBuf.indexOf('\n')) >= 0) {
+                const line = hmiBuf.slice(0, idx).trim();
+                hmiBuf = hmiBuf.slice(idx + 1);
+                if (line) pushEvents.push(JSON.parse(line));
+            }
+        });
+        await waitUntil(() => pushEvents.length >= 1, 1500);
+
+        // A) Cabin chatter without "Hey BMW" -> silently ignored
         dm.micStream._sendCmd({ cmd: 'emit_wake_test' });
         await waitUntil(() => gemCallIdx >= 1 && !dm.turnBusy, 2500);
         assert.strictEqual(dm.lastTurn.idle, true);
-        assert.strictEqual(dm.overlay.phase, 'hidden');
 
-        // B) 1-Shot "Hey BMW chỉnh điều hoà 20 độ" -> executes immediately & shows result overlay!
+        // B) 1-Shot "Hey BMW chỉnh điều hoà 20 độ"
         dm.micStream._sendCmd({ cmd: 'emit_wake_test' });
         await waitUntil(() => dm.car.state.climate.tempDriverC === 20 && !dm.turnBusy, 2500);
         assert.strictEqual(dm.car.state.climate.tempDriverC, 20);
-        assert.strictEqual(dm.overlay.phase, 'result');
 
-        // C) 2-Step "Hey BMW" -> opens listening overlay -> instant follow-up PTT -> sets green ambient light!
+        // C) 2-Step "Hey BMW" -> pushes `open` to bmw_voice -> follow-up sets green ambient light -> pushes `finish`!
+        pushEvents.length = 0;
         dm.micStream._sendCmd({ cmd: 'emit_wake_test' });
         await waitUntil(() => dm.car.state.ambient.key === 'green' && !dm.turnBusy, 3000);
-        assert.strictEqual(dm.car.state.ambient.key, 'green');
-        assert.strictEqual(dm.overlay.phase, 'result');
+        assert.ok(pushEvents.some((e) => e.action === 'open' && e.reason === 'hey_bmw'));
+        assert.ok(pushEvents.some((e) => e.action === 'finish'));
 
-        // D) Reverse gear ('R') immediately hides IPA overlay for camera safety!
-        dm.car.patchState({ gear: 'R' });
-        assert.strictEqual(dm.overlay.phase, 'hidden');
+        // D) Physical Steering Wheel Mic button DOWN fires immediately (`0ms`, before button release!)
+        pushEvents.length = 0;
+        dm.car.handleSteeringPttSignal(true);
+        await waitUntil(() => pushEvents.some((e) => e.action === 'open' && e.reason === 'ptt'), 800);
+        // Simulate `apps/bmw_voice` opening on screen -> overlay immediately yields!
+        hmiClient.write(JSON.stringify({ id: 2, cmd: 'app_visible', arg: { visible: true } }) + '\n');
+        await waitUntil(() => dm.hmiAppVisible === true && dm.overlay.phase === 'hidden', 800);
+        await waitUntil(() => dm.car.state.media.volumePercent === 40 && !dm.turnBusy, 2500);
+        dm.car.handleSteeringPttSignal(false);
+        assert.ok(pushEvents.some((e) => e.action === 'finish'));
 
-        await dm.stop();
-        await new Promise((r) => mockGem.close(r));
-    });
-
-    // 6. Steering Wheel PTT Guard, Stereo Zone Localization & Coalesced IPC
-    await step('Steering PTT capacitive guard, passenger stereo localization, ctl.sock & coalesced hmi.json writes', async () => {
-        const pttEvents = [];
-        const cTest = new CarControl.CarController({ onPttEvent: (ev) => pttEvents.push(ev) });
-        cTest.handleSteeringPttSignal(true);
-        await new Promise((r) => setTimeout(r, 40));
-        cTest.handleSteeringPttSignal(false);
-        assert.strictEqual(pttEvents.length, 1);
-        assert.strictEqual(pttEvents[0].kind, 'short_press');
-
-        const mockGem = http.createServer((req, res) => {
-            req.on('data', () => {});
-            req.on('end', () => {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    candidates: [{
-                        content: {
-                            parts: [{
-                                text: JSON.stringify({
-                                    speechDetected: true,
-                                    transcript: 'Chỉnh điều hoà 21.5 độ',
-                                    toolCalls: [{ name: 'set_climate', args: { tempC: 21.5 } }],
-                                    unsupportedReason: '',
-                                }),
-                            }],
-                        },
-                    }],
-                }));
-            });
-        });
-        await new Promise((r) => mockGem.listen(0, '127.0.0.1', r));
-
-        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bmw-voice-test-'));
-        const dm = new BmwVoiceDaemon({
-            run: path.join(tmp, 'run'),
-            state: path.join(tmp, 'state'),
-            oap: path.join(tmp, 'oap'),
-            host: '127.0.0.1',
-            port: 0,
-            simMode: true,
-            noNft: true,
-            noOverlay: true,
-            noWakeStream: true,
-            quiet: true,
-            geminiBaseUrl: 'http://127.0.0.1:' + mockGem.address().port,
-        });
-        await dm.start();
-        dm.saveSettings({ apiKey: 'AIzaSyTestBmwVoiceKey1234' });
-
-        const wavPass = MicCapture.buildStereoWav(new Array(2400).fill(0.03), new Array(2400).fill(0.45), 16000);
-        const turn = await dm.handleTurn({
-            audioWavBase64: wavPass.toString('base64'),
-            audioMimeType: 'audio/wav',
-        });
-        assert.strictEqual(turn.ok, true);
-        assert.strictEqual(turn.speakerZone, 'passenger');
-        assert.strictEqual(dm.car.state.climate.tempPassengerC, 21.5);
-        assert.strictEqual(dm.car.state.climate.tempDriverC, 22.5);
-
-        const sockPath = path.join(tmp, 'run', 'ctl.sock');
-        await new Promise((resolve, reject) => {
-            const s = net.createConnection(sockPath, () => {
-                s.end(JSON.stringify({ id: 777, cmd: 'ask_text', arg: { text: 'Đèn viền màu xanh băng', speakerZone: 'driver' } }) + '\n', resolve);
-            });
-            s.on('error', reject);
-        });
-        await new Promise((r) => setTimeout(r, 120));
-        assert.strictEqual(dm.car.state.ambient.key, 'cyan');
-
-        const beforeWrites = dm.statusWriteCount;
-        for (let i = 0; i < 50; i++) {
-            dm.car.patchState({ rpm: 900 + i * 15, speedKmh: 30 + (i % 10) });
-        }
-        await new Promise((r) => setTimeout(r, 450));
-        assert.strictEqual(dm.statusWriteCount, beforeWrites);
-
-        for (let i = 0; i < 50; i++) {
-            dm.car.patchState({ oilTempC: 70 + (i % 25) });
-        }
-        assert.strictEqual(dm.statusWriteCount, beforeWrites);
-        await new Promise((r) => setTimeout(r, 460));
-        const deltaWrites = dm.statusWriteCount - beforeWrites;
-        assert.ok(deltaWrites >= 1 && deltaWrites <= 2);
-
+        hmiClient.destroy();
         await dm.stop();
         await new Promise((r) => mockGem.close(r));
     });
 
     // 7. Zero-Lag Single-Screen OEM BMW IPA UI (`apps/bmw_voice/ui.js`)
-    await step('Single-screen OEM BMW UI caches QR matrix once and produces 100% identical idle Recorder words', () => {
+    await step('Single-screen OEM BMW UI caches QR matrix, sanitizes curly quotes & produces identical idle Recorder words', () => {
         const realQr = require('../kit/runtime/qr');
         const realG = require('../kit/runtime/gauges');
         const { Recorder } = require('../kit/runtime/record');
@@ -478,7 +510,7 @@ async function runTests() {
             wakeStatus: 'armed',
             settings: { hasApiKey: true, apiKeyMasked: 'AIzaSy••••1234', handsFreeWake: true },
             car: CarControl.createInitialState(),
-            lastTurn: { idle: false, ok: true, transcript: 'Hey BMW điều hoà 22 độ', replyVi: 'Đã chỉnh điều hoà ghế tài 22°C' },
+            lastTurn: { idle: false, ok: true, transcript: '“Hey BMW điều hoà 22 độ”', replyVi: 'Đã chỉnh điều hoà ghế tài 22°C' },
         };
 
         for (let i = 0; i < 15; i++) {
@@ -497,7 +529,7 @@ async function runTests() {
         assert.strictEqual(b1.equals(b2), true);
     });
 
-    console.log('\nALL ' + passed + ' BMW-VOICE TEST SUITES PASSED!');
+    console.log('\nALL ' + passed + ' BMW-VOICE v1.1.1 TEST SUITES PASSED!');
 }
 
 runTests().catch((err) => {

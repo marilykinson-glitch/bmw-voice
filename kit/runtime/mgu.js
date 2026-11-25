@@ -777,6 +777,8 @@ async function runInner(impl) {
             });
         return opening;
     };
+    ctx.openApp = () => (entryUuids[0] ? openEntry(entryUuids[0], 3) : ui.open(mainName));
+    ctx.closeApp = () => ui.close(mainName);
     // a tap on the home-screen widget opens the app
     widget.onTap(() => { if (entryUuids[0]) openEntry(entryUuids[0]); });
     app.on('entryPointExecute', (uuid, reason, name) => {

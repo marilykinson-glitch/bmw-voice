@@ -13,7 +13,7 @@
       "requires": {
         "idrive7-renderd": "2.1.7",
         "mgu-inputgate": "1.0.0",
-        "bmw-voice": "1.1.0"
+        "bmw-voice": "1.1.1"
       },
       "build": {
         "python": "kit/tools/build.py",

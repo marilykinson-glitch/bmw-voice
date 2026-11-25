@@ -60,6 +60,13 @@ function hexColor(hex, alpha) {
     return packRgba((n >> 16) & 255, (n >> 8) & 255, n & 255, alpha === undefined ? 1 : alpha);
 }
 
+function cleanAtlasText(s) {
+    return String(s || '')
+        .replace(/[\u201c\u201d\u201e\u00ab\u00bb]/g, '"')
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u2014\u2013]/g, '-');
+}
+
 function frameMsg(type, payload) {
     const len = payload ? payload.length : 0;
     const pad = (4 - (len & 3)) & 3;
@@ -247,7 +254,7 @@ class DrawList {
     }
 
     fitText(fontBank, str, size, bold, maxWidth) {
-        const s = String(str || '');
+        const s = cleanAtlasText(str);
         if (!s) return '';
         const font = fontBank.getFont(bold, size);
         if (!font) return s;
@@ -261,7 +268,7 @@ class DrawList {
     }
 
     text(fontBank, str, x, y, size, col, opts) {
-        const s = String(str || '');
+        const s = cleanAtlasText(str);
         if (!s) return 0;
         const o = opts || {};
         const font = fontBank.getFont(!!o.bold, size);
@@ -480,12 +487,13 @@ class IpaOverlay {
         }
     }
 
-    _sendPlace() {
+    _sendPlace(overrideW) {
         if (!this.ready) return;
+        const useW = overrideW || this.box.w;
         const b = Buffer.alloc(28);
         b.writeInt32LE(this.box.x | 0, 0);
         b.writeInt32LE(this.box.y | 0, 4);
-        b.writeInt32LE(this.box.w | 0, 8);
+        b.writeInt32LE(useW | 0, 8);
         b.writeInt32LE(this.box.h | 0, 12);
         b.writeFloatLE(1.0, 16);
         b.writeFloatLE(0.0, 20);
@@ -537,13 +545,14 @@ class IpaOverlay {
 
     _scheduleTopReassertions() {
         while (this.reassertTimers.length) clearTimeout(this.reassertTimers.pop());
-        // HmiMain3D pops up its unsupported-language dialog ~80-250ms after physical PTT press and resets
-        // Wayland layer order; toggling SHOW(0)->SHOW(1) puts our BMW IPA layer straight back on top!
-        [240, 540].forEach((delayMs) => {
+        // Recreate & re-show the Wayland IVI layer at +220ms and +540ms so HmiMain3D's system popup
+        // can never bury our BMW IPA overlay on CarPlay or background screens.
+        [220, 540].forEach((delayMs, idx) => {
             const t = setTimeout(() => {
                 if (this.phase === 'hidden' || !this.ready || !this.placed) return;
                 this._write(u32Msg(M.SHOW, [0]));
                 this.visible = false;
+                this._sendPlace(idx === 0 ? (this.box.w - 1) : this.box.w);
                 this._renderAndSend(true);
             }, delayMs);
             if (t.unref) t.unref();
@@ -597,9 +606,10 @@ class IpaOverlay {
         this.ok = !!turn.ok;
         this.speakerZone = turn.speakerZone === 'passenger' ? 'passenger' : 'driver';
         const prefix = turn.ok ? '✓ ' : '';
-        this.headline = prefix + String(turn.replyVi || 'Đã thực thi.');
-        this.subline = turn.transcript
-            ? ((this.speakerZone === 'passenger' ? '[Ghế phụ] ' : '') + '“' + turn.transcript + '”')
+        this.headline = prefix + cleanAtlasText(turn.replyVi || 'Đã thực thi.');
+        const cleanTr = cleanAtlasText(turn.transcript).trim().replace(/^"+|"+$/g, '').trim();
+        this.subline = cleanTr
+            ? ((this.speakerZone === 'passenger' ? '[Ghế phụ] ' : '') + '"' + cleanTr + '"')
             : 'Trợ lý Giọng nói BMW';
 
         this._renderAndSend(true);

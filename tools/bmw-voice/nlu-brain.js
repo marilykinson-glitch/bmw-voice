@@ -1,56 +1,89 @@
 'use strict';
 /**
- * nlu-brain.js - Fast Deterministic Vietnamese NLU + Gemini Multimodal Audio & "Hey BMW" Wake Decoder (`bmw-voice`).
+ * nlu-brain.js - Deterministic Vietnamese NLU + Grounded Gemini Audio & "Hey BMW" Decoder (`bmw-voice` `v1.1.1`).
  *
- * Principles:
- *   1. Strictly scoped to the 6 real OEM BMW IPA capabilities (`set_climate`, `set_seat_comfort`,
- *      `set_ambient_light`, `control_media`, `control_windows`, `query_vehicle_status`).
- *   2. Native "Hey BMW" hands-free wake support:
- *      - 1-shot: "Hey BMW chỉnh điều hoà 22 độ" -> executes immediately in 1 turn.
- *      - 2-step: "Hey BMW" -> pops up BMW IPA overlay ("Xin chào, tôi đang lắng nghe…") -> listens for follow-up.
- *      - Cabin chatter without "Hey BMW" -> deterministically ignored (`ignored: true`, zero screen popups).
- *   3. Honest hardware boundary & zero-hallucination confirmation built strictly from `r.summaryVi`.
+ * Anti-Hallucination Architecture:
+ *   1. Zero example sentences in Gemini system prompts (`temperature: 0.0`) so Gemini can NEVER parrot or append
+ *      example commands onto unrelated speech or mic checks.
+ *   2. Explicit Mic-Test recognizer ("Alo", "Mày nghe tao nói không?", "Nghe rõ không?"): responds cleanly confirming
+ *      the ceiling mic is working with ZERO hardware calls, stripping any hallucinated trailing sentence.
+ *   3. Deterministic Transcript Grounding (`groundToolCallsAgainstTranscript`):
+ *      - Always prefers deterministic `parseOfflineVietnamese(transcript)` over raw LLM `toolCalls`.
+ *      - Blocks any LLM `toolCalls` whose target domain keywords or numeric values (`tempC`, `fanLevel`,
+ *        `volumePercent`, `brightness`) do not actually appear in `transcript`!
  *
  * Node 8 (ES2017) compatible.
  */
 const Up = require('./uplink');
 
 const TOOL_CATALOG_LINES = [
-    'DANH SÁCH ĐÚNG 6 CÔNG CỤ HỖ TRỢ TRÊN XE BMW:',
-    '1. set_climate: {systemOn?:bool, maxAc?:bool, defrost?:bool, tempC?:16..28, deltaTempC?:-3..3, zone?:"driver"|"passenger"|"both", fanLevel?:1..5, freshAir?:bool, sync?:bool}',
-    '   ("tôi nóng quá" -> deltaTempC:-1.5; "tôi lạnh quá" -> deltaTempC:1.5; nếu nói "2 bên / cả xe" -> zone:"both")',
+    'DANH SÁCH 6 NHÓM CÔNG CỤ DUY NHẤT ĐƯỢC PHÉP GỌI KHI NGƯỜI NÓI YÊU CẦU RÕ RÀNG:',
+    '1. set_climate: {systemOn?:bool, maxAc?:bool, defrost?:bool, tempC?:16|18..28, deltaTempC?:-3..3, zone?:"driver"|"passenger"|"both", fanLevel?:1..5, freshAir?:bool, sync?:bool}',
     '2. set_seat_comfort: {seat?:"driver"|"passenger"|"both", heatingLevel?:0..3, coolingLevel?:0..3, massage?:bool, wheelHeat?:bool}',
     '3. set_ambient_light: {on?:bool, color?:"bronze"|"orange"|"white"|"blue"|"cyan"|"green"|"lilac"|"red", brightness?:10..100}',
     '4. control_media: {action:"volume"|"volume_up"|"volume_down"|"mute"|"unmute"|"play"|"pause"|"next"|"previous", volumePercent?:0..100}',
     '5. control_windows: {target:"driver"|"passenger"|"rear"|"all"|"sunroof"|"sunshade", action:"open"|"close"|"vent"}',
-    '6. query_vehicle_status: {} (khi hỏi tình trạng xe, nhiệt độ dầu, nước mát, bình ắc quy, xăng, áp suất lốp)',
-    'Nếu người lái yêu cầu mở cốp sau, gập gương, khoá cửa hoặc đèn đọc sách trần xe: để toolCalls:[] và ghi unsupportedReason ngắn gọn rằng trên BMW G30 chức năng đó dùng nút bấm vật lý.',
+    '6. query_vehicle_status: {}',
+    'QUY TẮC CHỐNG ẢO GIÁC BẮT BUỘC:',
+    '- Chỉ chép ĐÚNG nguyên văn những từ người dùng thực sự phát âm trong đoạn âm thanh. TUYỆT ĐỐI KHÔNG tự nối thêm vế câu, không tự đoán ý, không bịa số độ C.',
+    '- Nếu người nói chỉ thử mic, hỏi xem có nghe thấy không, nói chuyện phiếm hoặc câu nói không liên quan tới 6 công cụ trên: giữ đúng transcript nghe được và BẮT BUỘC trả "toolCalls":[].',
+    '- Nếu yêu cầu mở cốp, gập gương, khoá cửa hoặc đèn đọc sách trần xe: trả "toolCalls":[] và ghi ngắn gọn trong unsupportedReason là chức năng đó trên BMW G30 dùng nút vật lý.',
 ];
 
 const COMPACT_SYSTEM_PROMPT = [
-    'Bạn là bộ giải mã giọng nói Tiếng Việt cho Trợ lý BMW nguyên bản trên xe BMW iDrive 7.',
+    'Bạn là bộ nhận dạng giọng nói Tiếng Việt chính xác nguyên văn cho xe BMW iDrive 7.',
     'Trả về DUY NHẤT 1 JSON hợp lệ (không markdown):',
-    '{"speechDetected":bool,"transcript":"câu tiếng Việt nghe được nguyên văn","toolCalls":[{"name":"...","args":{...}}],"unsupportedReason":""}',
-    'Nếu băng ghi âm chỉ có tiếng ồn/im lặng: {"speechDetected":false,"transcript":"","toolCalls":[],"unsupportedReason":""}',
+    '{"speechDetected":bool,"transcript":"nguyên văn câu nghe được","toolCalls":[],"unsupportedReason":""}',
+    'Nếu chỉ có tiếng ồn hoặc im lặng: {"speechDetected":false,"transcript":"","toolCalls":[],"unsupportedReason":""}',
 ].concat(TOOL_CATALOG_LINES).join('\n');
 
 const WAKE_SYSTEM_PROMPT = [
-    'Bạn là bộ nhận diện khẩu lệnh rảnh tay "Hey BMW" + giải mã lệnh Tiếng Việt cho xe BMW iDrive 7.',
+    'Bạn là bộ nhận diện từ khoá rảnh tay "Hey BMW" và chép lời nguyên văn Tiếng Việt cho xe BMW iDrive 7.',
     'Trả về DUY NHẤT 1 JSON hợp lệ (không markdown):',
-    '{"speechDetected":bool,"wakeDetected":bool,"wakeOnly":bool,"transcript":"nguyên văn câu nghe được","toolCalls":[{"name":"...","args":{...}}],"unsupportedReason":""}',
-    'QUY TẮC BẮT BUỘC CHO CHẾ ĐỘ RẢNH TAY:',
-    '- Chỉ đặt "wakeDetected":true KHI người nói thực sự gọi từ khoá đánh thức xe ở đầu câu: "Hey BMW", "Ê BMW", "Ok BMW", "Hello BMW", "Hi BMW", "BMW ơi", "Hey Bimmer" (hoặc phát âm tiếng Việt "Hây Bi Em Đắp Liu" / "Hây Bê Em Vê").',
-    '- Nếu là tiếng nói chuyện phiếm trong xe, hát theo nhạc, tiếng đài radio hoặc KHÔNG có câu gọi "Hey BMW": BẮT BUỘC đặt "wakeDetected":false, "wakeOnly":false, "toolCalls":[].',
-    '- Nếu người nói CHỈ gọi "Hey BMW" (chưa nói lệnh điều khiển xe): đặt "wakeDetected":true, "wakeOnly":true, "toolCalls":[].',
-    '- Nếu người nói gọi "Hey BMW" KÈM câu lệnh luôn (ví dụ "Hey BMW chỉnh điều hoà 22 độ"): đặt "wakeDetected":true, "wakeOnly":false và điền đúng "toolCalls".',
+    '{"speechDetected":bool,"wakeDetected":bool,"wakeOnly":bool,"transcript":"nguyên văn câu nghe được","toolCalls":[],"unsupportedReason":""}',
+    'QUY TẮC RẢNH TAY:',
+    '- Chỉ đặt "wakeDetected":true KHI đầu câu thực sự có lời gọi xe: Hey BMW, Ê BMW, Ok BMW, Hello BMW, Hi BMW, BMW ơi, Hey Bimmer (hoặc phát âm tiếng Việt tương đương).',
+    '- Nếu KHÔNG có lời gọi BMW ở đầu câu: BẮT BUỘC đặt "wakeDetected":false, "wakeOnly":false, "toolCalls":[].',
+    '- Nếu chỉ gọi "Hey BMW" mà chưa nói lệnh điều khiển: đặt "wakeDetected":true, "wakeOnly":true, "toolCalls":[].',
+    '- Nếu gọi "Hey BMW" kèm câu lệnh điều khiển thật sự: đặt "wakeDetected":true, "wakeOnly":false và điền đúng "toolCalls".',
 ].concat(TOOL_CATALOG_LINES).join('\n');
 
-// Matches "Hey BMW", "Ê BMW", "Ok BMW", "Hello BMW", "BMW ơi", and Vietnamese phonetic transcriptions
-const HEY_BMW_RE = /^[\s,."“”'!?-]*((?:hey|hây|hay|hê|ê|ok|okay|hello|hi|này|ơi)\s+(?:bmw|b\.m\.w\.?|bimmer|bê\s*em(?:\s*vê|\s*đắp\s*liu|\s*đúp\s*lưu)?|bi\s*em(?:\s*đắp\s*liu|\s*vê)?)|(?:bmw|bimmer)\s+ơi)(?=$|[\s,.:;!?'"“”-])[\s,.:;!?'"“”-]*/i;
-const POLITE_TAIL_RE = /^(?:ơi|à|ạ|dạ|nhé|nha|hả|nghe\s*không)?[\s,.:;!?-]*$/i;
+const HEY_BMW_RE = /^[\s,."“”'!?-]*((?:hey|hây|hay|hê|he|ê|ok|okay|hello|hi|này|ơi)\s+(?:bmw|b\.m\.w\.?|bm\b|bimmer|bê\s*em(?:\s*vê|\s*đắp\s*liu|\s*đúp\s*lưu)?|bi\s*em(?:\s*đắp\s*liu|\s*vê)?)|(?:bmw|bimmer)\s+ơi)(?=$|[\s,.:;!?'"“”-])[\s,.:;!?'"“”-]*/i;
+const POLITE_TAIL_RE = /^(?:ơi|à|ạ|dạ|nhé|nha|hả|nghe\s*không|nghe\s*rõ\s*không)?[\s,.:;!?-]*$/i;
+
+// Matches mic-check phrases such as "Alo", "Mày nghe tao nói không?", "Có nghe rõ không?", "Test mic"
+const MIC_CHECK_RE = /^[\s,."“”'!?-]*(?:(?:alo|a\s*lô)(?:\s+\d+)*|(?:ê\s+|này\s+)?(?:mày|bạn|em|xe|bmw)?\s*(?:có\s+)?nghe\s*(?:thấy\s*)?(?:tao|anh|mình|tôi|em)?\s*(?:nói(?:\s*gì)?|rõ)?\s*không(?:\s*(?:vậy|đấy|hả|nhỉ))?|(?:thử|test|kiểm\s*tra)\s*(?:cái\s*)?(?:mic|micro))(?=$|[\s,.:;!?'"“”-])/i;
+
+const VI_TEMP_WORDS = [
+    [/mười\s*sáu(?:\s*rưỡi)?/, 16],
+    [/mười\s*tám\s*rưỡi/, 18.5], [/mười\s*tám/, 18],
+    [/mười\s*chín\s*rưỡi/, 19.5], [/mười\s*chín/, 19],
+    [/hai\s*(?:mươi\s*)?mốt\s*rưỡi/, 21.5], [/hai\s*(?:mươi\s*)?mốt/, 21],
+    [/hai\s*(?:mươi\s*)?hai\s*rưỡi/, 22.5], [/hai\s*(?:mươi\s*)?hai/, 22],
+    [/hai\s*(?:mươi\s*)?ba\s*rưỡi/, 23.5], [/hai\s*(?:mươi\s*)?ba/, 23],
+    [/hai\s*(?:mươi\s*)?tư\s*rưỡi|hai\s*(?:mươi\s*)?bốn\s*rưỡi/, 24.5],
+    [/hai\s*(?:mươi\s*)?tư|hai\s*(?:mươi\s*)?bốn/, 24],
+    [/hai\s*(?:mươi\s*)?lăm\s*rưỡi/, 25.5], [/hai\s*(?:mươi\s*)?lăm/, 25],
+    [/hai\s*(?:mươi\s*)?sáu\s*rưỡi/, 26.5], [/hai\s*(?:mươi\s*)?sáu/, 26],
+    [/hai\s*(?:mươi\s*)?bảy\s*rưỡi/, 27.5], [/hai\s*(?:mươi\s*)?bảy/, 27],
+    [/hai\s*(?:mươi\s*)?tám/, 28],
+    [/hai\s*mươi\s*rưỡi/, 20.5], [/hai\s*mươi/, 20],
+];
+
+function sanitizePlainQuotes(s) {
+    let out = String(s || '')
+        .replace(/[\u201c\u201d\u201e\u00ab\u00bb]/g, '"')
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u2014\u2013]/g, '-')
+        .trim();
+    if (out.length >= 2 && ((out[0] === '"' && out[out.length - 1] === '"') || (out[0] === "'" && out[out.length - 1] === "'"))) {
+        out = out.slice(1, -1).trim();
+    }
+    return out;
+}
 
 function extractHeyBmwWake(rawText) {
-    const s = String(rawText || '').trim();
+    const s = sanitizePlainQuotes(rawText);
     if (!s) return { matched: false, wakeOnly: false, commandText: '' };
     const m = HEY_BMW_RE.exec(s);
     if (!m) {
@@ -61,6 +94,29 @@ function extractHeyBmwWake(rawText) {
         return { matched: true, wakeOnly: true, commandText: '' };
     }
     return { matched: true, wakeOnly: false, commandText: rest };
+}
+
+function detectMicCheckUtterance(rawText, fromAudio) {
+    const s = sanitizePlainQuotes(rawText);
+    if (!s) return null;
+    const wk = extractHeyBmwWake(s);
+    const body = wk.matched ? wk.commandText : s;
+    if (!body) return null;
+
+    const m = MIC_CHECK_RE.exec(body);
+    if (!m) return null;
+
+    const after = body.slice(m[0].length).replace(/^[\s,.:;!?'"-]+/, '').trim();
+    // If audio transcription starts with a mic-check question ("Mày nghe tao nói không? ...") and Gemini
+    // hallucinated a second sentence after `?` or `.`, strip the hallucinated tail deterministically!
+    if (!after || (fromAudio && /^[?!.]/.test(body.slice(m[0].length).trim()))) {
+        const cleanTranscript = body.slice(0, m[0].length).trim() + (/\?$/.test(m[0]) ? '' : (/nghe|không/i.test(m[0]) ? '?' : ''));
+        return {
+            isMicCheck: true,
+            cleanTranscript: wk.matched ? ('Hey BMW, ' + cleanTranscript) : cleanTranscript,
+        };
+    }
+    return null;
 }
 
 function detectPhysicalOnlyUnsupported(text) {
@@ -78,13 +134,31 @@ function detectPhysicalOnlyUnsupported(text) {
     return '';
 }
 
+function extractSpokenTempC(low) {
+    const tempM = /(?:điều\s*hoà|nhiệt\s*độ|máy\s*lạnh|chỉnh|hạ|tăng|xuống|lên|đặt|về|mức)?\s*(\d{2}(?:[.,]5)?)\s*(?:độ|°|c\b)/.exec(low)
+        || /(?:điều\s*hoà|nhiệt\s*độ|máy\s*lạnh)\s*(?:xuống|lên|về|ở|mức)?\s*(\d{2}(?:[.,]5)?)\b/.exec(low);
+    if (tempM) {
+        const tv = parseFloat(tempM[1].replace(',', '.'));
+        if (tv >= 16 && tv <= 28) {
+            return /rưỡi/.test(low.slice(tempM.index, tempM.index + tempM[0].length + 8)) && (tv % 1 === 0) ? (tv + 0.5) : tv;
+        }
+    }
+    for (let i = 0; i < VI_TEMP_WORDS.length; i++) {
+        const pair = VI_TEMP_WORDS[i];
+        if (new RegExp(pair[0].source + '\\s*(?:độ|°|c\\b)?').test(low) && /điều\s*hoà|nhiệt\s*độ|máy\s*lạnh|độ\b/.test(low)) {
+            return pair[1];
+        }
+    }
+    return null;
+}
+
 function parseOfflineVietnamese(rawText, speakerZone) {
     const wk = extractHeyBmwWake(rawText);
-    const text = (wk.matched && wk.commandText) ? wk.commandText : String(rawText || '').trim();
+    const text = (wk.matched && wk.commandText) ? wk.commandText : sanitizePlainQuotes(rawText);
     const low = text.toLowerCase();
     if (!low) return [];
 
-    const zone = /(cả\s*2|hai\s*bên|cả\s*xe|2\s*vùng|toàn\s*xe)/.test(low) ? 'both'
+    const zone = /(cả\s*2|cả\s*hai|hai\s*bên|2\s*bên|cả\s*xe|2\s*vùng|hai\s*vùng|toàn\s*xe)/.test(low) ? 'both'
         : /(ghế\s*phụ|bên\s*phụ)/.test(low) ? 'passenger'
             : /(ghế\s*tài|ghế\s*lái|bên\s*tài)/.test(low) ? 'driver'
                 : (speakerZone || 'driver');
@@ -122,48 +196,61 @@ function parseOfflineVietnamese(rawText, speakerZone) {
         hasClim = true;
     }
 
-    const tempM = /(?:điều\s*hoà|nhiệt\s*độ|máy\s*lạnh|chỉnh|hạ|tăng|xuống|lên|đặt)?\s*(\d{2}(?:[.,]5)?)\s*(?:độ|°|c\b)/.exec(low);
-    if (tempM) {
-        const tv = parseFloat(tempM[1].replace(',', '.'));
-        if (tv >= 16 && tv <= 28) {
-            clim.tempC = tv;
-            clim.zone = zone;
-            hasClim = true;
-        }
-    } else if (!clim.maxAc && /(nóng\s*quá|hơi\s*nóng|giảm\s*nhiệt|hạ\s*nhiệt)/.test(low)) {
+    const spokenTemp = extractSpokenTempC(low);
+    const deltaStepM = /(giảm|hạ|tăng)\s*(?:nhiệt\s*độ\s*|điều\s*hoà\s*)?([1-3](?:[.,]5)?)\s*độ/.exec(low);
+    if (spokenTemp !== null) {
+        clim.tempC = spokenTemp;
+        clim.zone = zone;
+        hasClim = true;
+    } else if (deltaStepM) {
+        const mag = parseFloat(deltaStepM[2].replace(',', '.'));
+        clim.deltaTempC = /tăng/.test(deltaStepM[1]) ? mag : -mag;
+        clim.zone = zone;
+        hasClim = true;
+    } else if (!clim.maxAc && /(nóng\s*quá|hơi\s*nóng|cho\s*mát\s*hơn|lạnh\s*hơn|giảm\s*nhiệt|hạ\s*nhiệt)/.test(low)) {
         clim.deltaTempC = -1.5;
         clim.zone = zone;
         hasClim = true;
-    } else if (/(lạnh\s*quá|rét\s*quá|hơi\s*lạnh|tăng\s*nhiệt)/.test(low)) {
+    } else if (/(lạnh\s*quá|rét\s*quá|hơi\s*lạnh|cho\s*ấm\s*hơn|tăng\s*nhiệt)/.test(low)) {
         clim.deltaTempC = 1.5;
         clim.zone = zone;
         hasClim = true;
     }
 
-    const fanM = /(?:mức\s*gió|quạt\s*gió|gió\s*mức|gió\s*số|quạt\s*số|gió)\s*([1-5])/.exec(low);
+    const fanM = /(?:mức\s*gió|quạt\s*gió|gió\s*mức|gió\s*số|quạt\s*số|gió)\s*([1-5]|một|hai|ba|bốn|năm)/.exec(low);
     if (fanM) {
-        clim.fanLevel = parseInt(fanM[1], 10);
-        clim.zone = zone;
-        hasClim = true;
+        const fw = fanM[1];
+        const fv = fw === 'một' ? 1 : fw === 'hai' ? 2 : fw === 'ba' ? 3 : fw === 'bốn' ? 4 : fw === 'năm' ? 5 : parseInt(fw, 10);
+        if (fv >= 1 && fv <= 5) {
+            clim.fanLevel = fv;
+            clim.zone = zone;
+            hasClim = true;
+        }
     }
     if (hasClim) calls.push({ name: 'set_climate', args: clim });
 
     // 2. Seat Heating / Cooling / Massage / Steering Wheel Heat
     const seat = {};
     let hasSeat = false;
-    if (/sưởi\s*vô[\s-]*lăng|ấm\s*vô[\s-]*lăng/.test(low)) {
+    if (/sưởi\s*(vô[\s-]*lăng|tay\s*lái)|ấm\s*(vô[\s-]*lăng|tay\s*lái)/.test(low)) {
         seat.wheelHeat = !/tắt/.test(low);
         hasSeat = true;
     }
+    const parseStage = () => {
+        const m = /(?:mức|số)\s*([0-3]|không|một|hai|ba)/.exec(low);
+        if (!m) return null;
+        const w = m[1];
+        return w === 'không' ? 0 : w === 'một' ? 1 : w === 'hai' ? 2 : w === 'ba' ? 3 : parseInt(w, 10);
+    };
     if (/sưởi\s*ghế|ấm\s*ghế/.test(low)) {
-        const m = /mức\s*([0-3])|số\s*([0-3])/.exec(low);
-        seat.heatingLevel = /tắt/.test(low) ? 0 : (m ? parseInt(m[1] || m[2], 10) : 2);
+        const st = parseStage();
+        seat.heatingLevel = /tắt/.test(low) ? 0 : (st !== null ? st : 2);
         seat.seat = zone;
         hasSeat = true;
     }
     if (/(làm\s*mát|thông\s*gió|quạt)\s*ghế|mát\s*ghế/.test(low)) {
-        const m = /mức\s*([0-3])|số\s*([0-3])/.exec(low);
-        seat.coolingLevel = /tắt/.test(low) ? 0 : (m ? parseInt(m[1] || m[2], 10) : 2);
+        const st = parseStage();
+        seat.coolingLevel = /tắt/.test(low) ? 0 : (st !== null ? st : 2);
         seat.seat = zone;
         hasSeat = true;
     }
@@ -201,17 +288,17 @@ function parseOfflineVietnamese(rawText, speakerZone) {
     } else if (/bật\s*(tiếng|lại\s*tiếng|âm\s*thanh)|\bunmute\b/.test(low)) {
         calls.push({ name: 'control_media', args: { action: 'unmute' } });
     } else {
-        const volM = /(?:âm\s*lượng|loa|volume|tiếng)\s*(?:mức|xuống|lên)?\s*(\d{1,3})\s*%?/.exec(low);
+        const volM = /(?:âm\s*lượng|loa|volume|tiếng)\s*(?:mức|xuống|lên|ở|về)?\s*(\d{1,3})\s*%?/.exec(low);
         if (volM) {
             calls.push({ name: 'control_media', args: { action: 'volume', volumePercent: Math.max(0, Math.min(100, parseInt(volM[1], 10))) } });
-        } else if (/(tăng|to)\s*(âm\s*lượng|tiếng|loa)|to\s*lên/.test(low)) {
+        } else if (/(tăng|to|mở\s*to)\s*(âm\s*lượng|tiếng|loa)|to\s*lên/.test(low)) {
             calls.push({ name: 'control_media', args: { action: 'volume_up' } });
-        } else if (/(giảm|nhỏ|hạ)\s*(âm\s*lượng|tiếng|loa)|nhỏ\s*lại/.test(low)) {
+        } else if (/(giảm|nhỏ|hạ)\s*(âm\s*lượng|tiếng|loa)|nhỏ\s*(lại|xuống)/.test(low)) {
             calls.push({ name: 'control_media', args: { action: 'volume_down' } });
         }
     }
 
-    if (/bài\s*(tiếp|kế|sau)|qua\s*bài|next\s*bài/.test(low)) {
+    if (/bài\s*(tiếp|kế|sau)|qua\s*bài|next\s*bài|chuyển\s*bài/.test(low)) {
         calls.push({ name: 'control_media', args: { action: 'next' } });
     } else if (/bài\s*(trước|cũ)|lùi\s*bài/.test(low)) {
         calls.push({ name: 'control_media', args: { action: 'previous' } });
@@ -238,11 +325,75 @@ function parseOfflineVietnamese(rawText, speakerZone) {
     }
 
     // 6. Vehicle Status Check
-    if (/(tình\s*trạng|kiểm\s*tra|khám|thông\s*số)\s*xe|áp\s*suất\s*lốp|nhiệt\s*độ\s*(dầu|nước)|bình\s*(ắc\s*quy|12v)|bao\s*nhiêu\s*xăng|còn\s*mấy\s*vạch\s*xăng/.test(low)) {
+    if (/(tình\s*trạng|kiểm\s*tra|khám|thông\s*số)\s*xe|áp\s*suất\s*lốp|nhiệt\s*độ\s*(dầu|nước)|bình\s*(ắc\s*quy|12v)|bao\s*nhiêu\s*xăng|còn\s*(mấy\s*vạch\s*|bao\s*nhiêu\s*)?xăng/.test(low)) {
         calls.push({ name: 'query_vehicle_status', args: {} });
     }
 
     return calls;
+}
+
+/**
+ * Deterministic Anti-Hallucination Gate:
+ *   1. If `parseOfflineVietnamese(cmdText)` finds explicit Vietnamese commands, ALWAYS trust it over LLM `toolCalls`.
+ *   2. Otherwise, filter LLM `toolCalls` so every domain & numeric setpoint MUST be explicitly grounded in `cmdText`.
+ */
+function groundToolCallsAgainstTranscript(cmdText, rawGemCalls, speakerZone) {
+    const clean = sanitizePlainQuotes(cmdText);
+    const low = clean.toLowerCase();
+    if (!low) return [];
+
+    const offline = parseOfflineVietnamese(clean, speakerZone);
+    if (offline.length > 0) {
+        return offline;
+    }
+    if (!Array.isArray(rawGemCalls) || !rawGemCalls.length) return [];
+
+    const grounded = [];
+    for (let i = 0; i < rawGemCalls.length; i++) {
+        const tc = rawGemCalls[i];
+        if (!tc || typeof tc.name !== 'string') continue;
+        const a = (tc.args && typeof tc.args === 'object') ? Object.assign({}, tc.args) : {};
+
+        if (tc.name === 'set_climate') {
+            if (!/điều\s*hoà|máy\s*lạnh|\ba\/?c\b|nhiệt\s*độ|nóng|lạnh|rét|mát\s*hơn|ấm\s*hơn|hạ\s*nhiệt|tăng\s*nhiệt|sấy\s*kính|mờ\s*kính|tan\s*sương|quạt\s*gió|mức\s*gió|gió\s*trong|gió\s*ngoài|tuần\s*hoàn|\bsync\b|đồng\s*bộ/.test(low)) {
+                continue;
+            }
+            if (a.tempC !== undefined) {
+                const sp = extractSpokenTempC(low);
+                const intStr = String(Math.floor(Number(a.tempC) || 0));
+                if (sp === null && low.indexOf(intStr) < 0) {
+                    delete a.tempC;
+                } else if (sp !== null) {
+                    a.tempC = sp;
+                }
+            }
+            if (a.fanLevel !== undefined && !/[1-5]|một|hai|ba|bốn|năm/.test(low)) {
+                delete a.fanLevel;
+            }
+            const argKeys = Object.keys(a).filter((k) => k !== 'zone');
+            if (!argKeys.length) continue;
+            grounded.push({ name: 'set_climate', args: a });
+        } else if (tc.name === 'set_seat_comfort') {
+            if (!/ghế|vô[\s-]*lăng|tay\s*lái|massage|mát[\s-]*xa/.test(low)) continue;
+            grounded.push({ name: 'set_seat_comfort', args: a });
+        } else if (tc.name === 'set_ambient_light') {
+            if (!/đèn|viền|ambient|nội\s*thất|\bled\b/.test(low)) continue;
+            if (a.brightness !== undefined && !/\d/.test(low)) delete a.brightness;
+            if (!Object.keys(a).length) continue;
+            grounded.push({ name: 'set_ambient_light', args: a });
+        } else if (tc.name === 'control_media') {
+            if (!/âm\s*lượng|\bloa\b|tiếng|volume|mute|unmute|nhạc|\bbài\b|play|pause|dừng/.test(low)) continue;
+            if (a.action === 'volume' && !/\d/.test(low)) continue;
+            grounded.push({ name: 'control_media', args: a });
+        } else if (tc.name === 'control_windows') {
+            if (!/kính|cửa\s*sổ|cửa\s*nóc|sunroof|rèm/.test(low) || /sấy\s*kính/.test(low)) continue;
+            grounded.push({ name: 'control_windows', args: a });
+        } else if (tc.name === 'query_vehicle_status') {
+            if (!/tình\s*trạng|kiểm\s*tra|khám|thông\s*số|áp\s*suất|lốp|dầu|nước\s*mát|ắc\s*quy|12v|xăng|odo|\bkm\b/.test(low)) continue;
+            grounded.push({ name: 'query_vehicle_status', args: {} });
+        }
+    }
+    return grounded;
 }
 
 function parseJsonLoose(raw) {
@@ -272,15 +423,15 @@ async function decodeWithGemini(opts) {
     }
     userParts.push({
         text: opts.text
-            ? ('Người ngồi (' + opts.speakerZone + ') nói: "' + opts.text + '"')
+            ? ('Người ngồi (' + opts.speakerZone + ') nói nguyên văn: "' + opts.text + '"')
             : (wakeMode
-                ? ('Kiểm tra xem người ngồi (' + opts.speakerZone + ') có gọi "Hey BMW" không và giải mã câu lệnh tiếng Việt nếu có.')
-                : ('Giải mã câu lệnh tiếng Việt của người ngồi (' + opts.speakerZone + ') từ đoạn âm thanh này.')),
+                ? ('Chép đúng nguyên văn câu nghe được từ người ngồi (' + opts.speakerZone + ') và kiểm tra từ khoá Hey BMW.')
+                : ('Chép đúng nguyên văn câu tiếng Việt nghe được từ người ngồi (' + opts.speakerZone + '), tuyệt đối không bịa thêm câu.')),
     });
 
     const genCfg = {
-        temperature: 0.05,
-        maxOutputTokens: 280,
+        temperature: 0.0,
+        maxOutputTokens: 260,
         responseMimeType: 'application/json',
     };
     if (/gemini-3/i.test(model)) {
@@ -326,12 +477,12 @@ async function processVoiceOrText(opts) {
     const wakeMode = !!o.wakeMode;
     const speakerZone = o.speakerZone === 'passenger' ? 'passenger' : 'driver';
     const car = o.carController;
-    let transcript = String(o.text || '').trim();
+    let transcript = sanitizePlainQuotes(o.text || '');
     let plannedCalls = [];
     let unsupportedReason = '';
     let engine = 'offline';
 
-    // 1. Deterministic fast gate for plain-text commands (including plain-text `wakeMode` tests)
+    // 1. Deterministic fast gate for plain-text commands
     if (transcript && !o.audioWavBase64) {
         if (wakeMode) {
             const wk = extractHeyBmwWake(transcript);
@@ -361,6 +512,19 @@ async function processVoiceOrText(opts) {
                     actions: [],
                 };
             }
+            const mcWake = detectMicCheckUtterance(transcript, false);
+            if (mcWake) {
+                return {
+                    at: Date.now(),
+                    ok: true,
+                    micCheck: true,
+                    engine: 'offline',
+                    speakerZone,
+                    transcript: mcWake.cleanTranscript,
+                    replyVi: 'Mic trần BMW đang nghe rõ - mời đọc câu lệnh điều khiển xe.',
+                    actions: [],
+                };
+            }
             unsupportedReason = detectPhysicalOnlyUnsupported(wk.commandText);
             if (!unsupportedReason) {
                 plannedCalls = parseOfflineVietnamese(wk.commandText, speakerZone);
@@ -377,6 +541,19 @@ async function processVoiceOrText(opts) {
                     speakerZone,
                     transcript,
                     replyVi: 'Xin chào, mời nói câu lệnh tiếp theo…',
+                    actions: [],
+                };
+            }
+            const mc = detectMicCheckUtterance(transcript, false);
+            if (mc) {
+                return {
+                    at: Date.now(),
+                    ok: true,
+                    micCheck: true,
+                    engine: 'offline',
+                    speakerZone,
+                    transcript: mc.cleanTranscript,
+                    replyVi: 'Mic trần BMW đang nghe rõ - mời đọc câu lệnh điều khiển xe.',
                     actions: [],
                 };
             }
@@ -403,12 +580,12 @@ async function processVoiceOrText(opts) {
             engine = 'gemini';
 
             if (typeof gem.transcript === 'string' && gem.transcript.trim()) {
-                transcript = gem.transcript.trim();
+                transcript = sanitizePlainQuotes(gem.transcript);
             }
 
             if (wakeMode) {
                 const wkCheck = extractHeyBmwWake(transcript || '');
-                const hasBmwToken = /bmw|b\.m\.w|bimmer|bê\s*em|bi\s*em/i.test(transcript || '');
+                const hasBmwToken = /bmw|b\.m\.w|\bbm\b|bimmer|bê\s*em|bi\s*em/i.test(transcript || '');
                 if (gem.speechDetected === false || (!wkCheck.matched && !(gem.wakeDetected === true && hasBmwToken))) {
                     return {
                         at: Date.now(),
@@ -422,16 +599,27 @@ async function processVoiceOrText(opts) {
                         actions: [],
                     };
                 }
-                if (Array.isArray(gem.toolCalls) && gem.toolCalls.length > 0) {
-                    plannedCalls = gem.toolCalls.filter((c) => c && typeof c.name === 'string');
+
+                const mcWake = detectMicCheckUtterance(transcript, !!o.audioWavBase64);
+                if (mcWake) {
+                    return {
+                        at: Date.now(),
+                        ok: true,
+                        micCheck: true,
+                        engine,
+                        speakerZone,
+                        transcript: mcWake.cleanTranscript,
+                        replyVi: 'Mic trần BMW đang nghe rõ - mời đọc câu lệnh điều khiển xe.',
+                        actions: [],
+                    };
                 }
+
                 const cmdSlice = wkCheck.matched ? wkCheck.commandText : transcript;
-                if (!plannedCalls.length && cmdSlice) {
-                    unsupportedReason = detectPhysicalOnlyUnsupported(cmdSlice) || String(gem.unsupportedReason || '').trim();
-                    if (!unsupportedReason) {
-                        plannedCalls = parseOfflineVietnamese(cmdSlice, speakerZone);
-                    }
+                unsupportedReason = detectPhysicalOnlyUnsupported(cmdSlice) || String(gem.unsupportedReason || '').trim();
+                if (!unsupportedReason && cmdSlice) {
+                    plannedCalls = groundToolCallsAgainstTranscript(cmdSlice, gem.toolCalls, speakerZone);
                 }
+
                 if (!plannedCalls.length && !unsupportedReason && (gem.wakeOnly === true || wkCheck.wakeOnly)) {
                     return {
                         at: Date.now(),
@@ -453,17 +641,29 @@ async function processVoiceOrText(opts) {
                         engine,
                         speakerZone,
                         transcript: '',
-                        replyVi: 'Chưa nghe rõ câu lệnh — mời đọc lại giúp mình.',
+                        replyVi: 'Chưa nghe rõ câu lệnh - mời đọc lại giúp mình.',
                         actions: [],
                     };
                 }
-                if (Array.isArray(gem.toolCalls) && gem.toolCalls.length > 0) {
-                    plannedCalls = gem.toolCalls.filter((c) => c && typeof c.name === 'string');
+
+                const mcAudio = detectMicCheckUtterance(transcript, !!o.audioWavBase64);
+                if (mcAudio) {
+                    return {
+                        at: Date.now(),
+                        ok: true,
+                        micCheck: true,
+                        engine,
+                        speakerZone,
+                        transcript: mcAudio.cleanTranscript,
+                        replyVi: 'Mic trần BMW đang nghe rõ - mời đọc câu lệnh điều khiển xe.',
+                        actions: [],
+                    };
                 }
-                if (!plannedCalls.length && transcript) {
+
+                if (transcript) {
                     unsupportedReason = detectPhysicalOnlyUnsupported(transcript) || String(gem.unsupportedReason || '').trim();
                     if (!unsupportedReason) {
-                        plannedCalls = parseOfflineVietnamese(transcript, speakerZone);
+                        plannedCalls = groundToolCallsAgainstTranscript(transcript, gem.toolCalls, speakerZone);
                     }
                 }
             }
@@ -474,6 +674,7 @@ async function processVoiceOrText(opts) {
                     ok: false,
                     ignored: true,
                     wakeOnly: false,
+                    netError: e.message,
                     engine: 'wake_net_err',
                     speakerZone,
                     transcript: '',
@@ -487,8 +688,8 @@ async function processVoiceOrText(opts) {
                     ok: false,
                     engine: 'net_err',
                     speakerZone,
-                    transcript: '(Thu âm Mic trần)',
-                    replyVi: 'Chưa kết nối mạng tới Gemini (' + e.message.slice(0, 80) + '). Kiểm tra Wi-Fi/4G xe.',
+                    transcript: '',
+                    replyVi: 'Chưa kết nối mạng tới Gemini (' + sanitizePlainQuotes(e.message).slice(0, 72) + '). Kiểm tra Wi-Fi/4G xe.',
                     actions: [],
                 };
             }
@@ -513,8 +714,8 @@ async function processVoiceOrText(opts) {
             ok: false,
             engine,
             speakerZone,
-            transcript,
-            replyVi: unsupportedReason,
+            transcript: sanitizePlainQuotes(transcript),
+            replyVi: sanitizePlainQuotes(unsupportedReason),
             actions: [],
         };
     }
@@ -525,10 +726,10 @@ async function processVoiceOrText(opts) {
             ok: false,
             engine,
             speakerZone,
-            transcript,
+            transcript: sanitizePlainQuotes(transcript),
             replyVi: transcript
-                ? 'Chưa nhận diện được lệnh xe BMW (thử: "Điều hoà 22 độ", "Đèn màu cam", "Âm lượng 30%", "Tình trạng xe").'
-                : 'Cần dán Gemini API Key trong Cài đặt QR để nhận giọng nói Tiếng Việt từ Mic trần.',
+                ? 'Chưa nhận diện được lệnh điều khiển xe (thử: "Điều hoà 22 độ", "Đèn màu cam", "Âm lượng 30%").'
+                : 'Cần dán Gemini API Key trong Cài đặt QR để nhận giọng nói Tiếng Việt.',
             actions: [],
         };
     }
@@ -546,22 +747,25 @@ async function processVoiceOrText(opts) {
     }
 
     const allOk = actions.length > 0 && actions.every((a) => a.ok);
-    const replyVi = actions.map((a) => a.summaryVi).join(' · ');
+    const replyVi = sanitizePlainQuotes(actions.map((a) => a.summaryVi).join(' · '));
 
     return {
         at: Date.now(),
         ok: allOk,
         engine,
         speakerZone,
-        transcript,
+        transcript: sanitizePlainQuotes(transcript),
         replyVi,
         actions,
     };
 }
 
 module.exports = {
+    sanitizePlainQuotes,
     extractHeyBmwWake,
+    detectMicCheckUtterance,
     detectPhysicalOnlyUnsupported,
     parseOfflineVietnamese,
+    groundToolCallsAgainstTranscript,
     processVoiceOrText,
 };

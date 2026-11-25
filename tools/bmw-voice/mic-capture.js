@@ -517,12 +517,14 @@ class MicStreamEngine {
                 const wavBuffer = fs.readFileSync(ev.file);
                 unlinkSafe(ev.file);
                 const analysis = analyzeWavBuffer(wavBuffer, { swapChannels: this.opts.swapChannels });
-                p.resolve({
-                    wavBuffer,
-                    analysis,
-                    deviceUsed: ev.device || cand.hw,
-                    instantStream: true,
-                });
+                    p.resolve({
+                        wavBuffer,
+                        analysis,
+                        voicedChunks: typeof ev.voicedChunks === 'number' ? ev.voicedChunks : 4,
+                        snrDb: typeof ev.snrDb === 'number' ? ev.snrDb : 8,
+                        deviceUsed: ev.device || cand.hw,
+                        instantStream: true,
+                    });
             } catch (e) {
                 p.reject(e);
             }

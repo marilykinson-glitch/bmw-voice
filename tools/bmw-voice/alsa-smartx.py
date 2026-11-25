@@ -220,10 +220,11 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
             out_rate = 16000
 
     snr_db, floor_db = _measure_snr_and_floor(samples, out_channels, out_rate)
-    if 55 <= peak < 18000:
-        gain = min(16.0, 22000.0 / float(peak))
-        if snr_db < 4.2 and floor_db > -80.0:
-            max_noise_gain = 10.0 ** ((-32.0 - floor_db) / 20.0)
+    # Never amplify low-SNR background hiss/hum (`snr_db < 4.8`), which causes LLM speech hallucinations
+    if 90 <= peak < 18000 and snr_db >= 4.8:
+        gain = min(12.0, 21000.0 / float(peak))
+        if floor_db > -80.0:
+            max_noise_gain = 10.0 ** ((-34.0 - floor_db) / 20.0)
             gain = min(gain, max(1.0, max_noise_gain))
         if gain > 1.25:
             samples = array.array("h", (max(-32767, min(32767, int(x * gain))) for x in samples))
@@ -523,12 +524,13 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                         "durationMs": dur_ms,
                         "peak": f_peak,
                         "snrDb": snr_db,
+                        "voicedChunks": ptt_voiced,
                         "device": device,
                     })
                     ptt_buf.clear()
                     preroll.clear()
                     mode = "wake"
-                    wake_cooldown_until = time.monotonic() + 0.45
+                    wake_cooldown_until = time.monotonic() + 0.40
                 continue
 
             # 3. Background "Hey BMW" Wake Word Listener (`mode == "wake"`)
@@ -536,21 +538,20 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
             if now < wake_cooldown_until:
                 continue
 
-            if calib_count < 8:
+            if calib_count < 6:
                 if db > -85.0:
-                    floor_db = db if calib_count == 0 else (floor_db * 0.75 + db * 0.25)
-                    floor_db = max(-62.0, min(-26.0, floor_db))
-                    if hw_ch >= 3 and ref_db > -45.0:
+                    floor_db = db if calib_count == 0 else (floor_db * 0.72 + db * 0.28)
+                    floor_db = max(-62.0, min(-30.0, floor_db))
+                    if hw_ch >= 3 and ref_db > -35.0:
                         echo_offset_db = max(-22.0, min(6.0, db - ref_db))
                     calib_count += 1
                 continue
 
-            # Music reference echo check: when B&W speakers play CarPlay music (`ref_db > -38`),
-            # require mic level to rise meaningfully above speaker acoustic bleed
-            music_playing = (hw_ch >= 3) and (ref_db > -38.0)
+            # Music reference echo check: only engage speaker bleed floor during real audible playback (`ref_db > -30`)
+            music_playing = (hw_ch >= 3) and (ref_db > -30.0)
             expected_bleed = (ref_db + echo_offset_db) if music_playing else -90.0
-            thresh_db = max(-45.5, floor_db + 6.5, expected_bleed + 5.0)
-            is_voiced = (db >= thresh_db) and (pk >= 135)
+            thresh_db = max(-47.5, floor_db + 5.0, expected_bleed + 4.5)
+            is_voiced = (db >= thresh_db) and (pk >= 100)
 
             if not wake_active:
                 if is_voiced:
@@ -564,7 +565,11 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     wake_hint_sent = False
                 else:
                     if db > -85.0:
-                        floor_db = max(-62.0, min(-26.0, floor_db * 0.94 + db * 0.06))
+                        # Fast downward recovery so transient noise never deafens "Hey BMW"
+                        if db < floor_db:
+                            floor_db = max(-62.0, min(-30.0, floor_db * 0.70 + db * 0.30))
+                        else:
+                            floor_db = max(-62.0, min(-30.0, floor_db * 0.96 + db * 0.04))
                     if music_playing and db > -75.0:
                         echo_offset_db = max(-22.0, min(6.0, echo_offset_db * 0.95 + (db - ref_db) * 0.05))
             else:
@@ -573,7 +578,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                 if is_voiced:
                     wake_voiced += 1
                     wake_quiet = 0
-                    if not wake_hint_sent and wake_voiced >= 4 and (now - last_hint_at) > 3.5:
+                    if not wake_hint_sent and wake_voiced >= 3 and (now - last_hint_at) > 3.0:
                         wake_hint_sent = True
                         last_hint_at = now
                         _emit_json({"event": "speech_hint"})
@@ -587,13 +592,13 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     preroll.clear()
                     continue
 
-                if wake_quiet >= 10:  # 0.50s end-of-speech pause
-                    # "Hey BMW" has >= 3 syllables (>= 450ms = 9 chunks). Short coughs/clicks (<9 chunks) drop locally!
-                    if wake_voiced >= 9:
+                if wake_quiet >= 8:  # 0.40s end-of-speech pause
+                    # Brisk "Hey BMW" is >= 250ms voiced (5 chunks). Short clicks (<5 chunks) drop locally!
+                    if wake_voiced >= 5:
                         boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
                             bytes(wake_buf), out_channels, hw_rate
                         )
-                        if snr_db >= 4.4 and f_peak >= 900:
+                        if snr_db >= 3.5 and f_peak >= 500:
                             out_wav = os.path.join(work_dir, "wake_clip.wav")
                             _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
                             dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
