@@ -1,0 +1,26 @@
+# bmw-voice: Minimalist OEM-style Vietnamese Voice Assistant for BMW MGU (iDrive 7)
+# Starts strictly AFTER oapcontroller.service (never runs during early boot or inside Safe Mode).
+[Unit]
+Description=BMW Vietnamese Voice Assistant (bmw-voice)
+RequiresMountsFor=/var/opt /mnt/dataro
+After=local-fs.target network.target oapcontroller.service
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+RuntimeDirectory=bmw-voice
+RuntimeDirectoryMode=0755
+Nice=10
+# LimitCORE=1 ensures Linux kernel |/usr/bin/crashhandler skips any child signal
+LimitCORE=1
+ExecStartPre=/bin/sleep 6
+ExecStart=/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bmw-voice/current/bmw-voice.js run'
+ExecStopPost=-/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bmw-voice/current/bmw-voice.js fwclose'
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=oapcontroller.service

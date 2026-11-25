@@ -1,0 +1,27 @@
+{
+  "id": "bmw_voice",
+  "title": "Trợ lý BMW",
+  "description": "Trợ lý giọng nói Tiếng Việt tối giản theo chuẩn nguyên bản BMW Intelligent Personal Assistant trên MGU iDrive 7: bấm nút Mic vô-lăng để chỉnh điều hoà, sưởi/làm mát ghế, đèn viền nội thất, âm lượng/chuyển bài nhạc, cửa kính và hỏi tình trạng xe.",
+  "version": "1.0.0",
+  "vendor": "custom",
+  "loggingId": "OABV",
+  "signals": {},
+  "screens": [
+    {
+      "name": "MAIN",
+      "kind": "canvas",
+      "title": "Trợ lý BMW",
+      "buttons": [
+        [
+          "BTN_MIC",
+          "Nói lệnh"
+        ],
+        [
+          "BTN_QR",
+          "Cài đặt QR"
+        ]
+      ]
+    }
+  ],
+  "settings": []
+}

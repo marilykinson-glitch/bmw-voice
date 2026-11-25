@@ -1,0 +1,74 @@
+{
+  "id": "bmw-voice",
+  "kind": "tool",
+  "version": "1.0.0",
+  "title": "Trợ lý Giọng nói BMW (Tiếng Việt)",
+  "description": "Trợ lý giọng nói Tiếng Việt tối giản theo đúng chuẩn BMW Intelligent Personal Assistant trên MGU iDrive 7 (SP18): bấm nút Mic vô-lăng để điều khiển điều hoà, sưởi/làm mát ghế, đèn viền nội thất, âm lượng/chuyển bài nhạc, cửa kính và xem thông số xe — thực thi tức thì, không ngắt nhạc CarPlay.",
+  "license": "GPL-3.0-or-later",
+  "mguHmi": [
+    "ID7"
+  ],
+  "uninstallable": true,
+  "requires": {
+    "mgu-deploy": "0.7.11",
+    "mgu-python": "1.0.2"
+  },
+  "files": [
+    {
+      "path": "bmw-voice.js",
+      "mode": "0644"
+    },
+    {
+      "path": "car-control.js",
+      "mode": "0644"
+    },
+    {
+      "path": "nlu-brain.js",
+      "mode": "0644"
+    },
+    {
+      "path": "mic-capture.js",
+      "mode": "0644"
+    },
+    {
+      "path": "alsa-smartx.py",
+      "mode": "0755"
+    },
+    {
+      "path": "uplink.js",
+      "mode": "0644"
+    },
+    {
+      "path": "page.html",
+      "mode": "0644"
+    },
+    {
+      "path": "LICENSE.GPL-3.0",
+      "mode": "0644"
+    }
+  ],
+  "units": [
+    {
+      "name": "bmw-voice.service"
+    }
+  ],
+  "enable": [
+    {
+      "unit": "bmw-voice.service",
+      "target": "oapcontroller.service"
+    }
+  ],
+  "recmgr": [
+    "bmw-voice"
+  ],
+  "restart": [
+    "bmw-voice.service"
+  ],
+  "deactivate": [
+    "node",
+    "bmw-voice.js",
+    "fwclose"
+  ],
+  "internet": true,
+  "uids": "state/internet-uids"
+}

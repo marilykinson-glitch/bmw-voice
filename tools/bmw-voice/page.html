@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Trợ lý BMW — Cài đặt Giọng nói Tiếng Việt</title>
+<style>
+  :root {
+    --bg: #080c14;
+    --card: #111827;
+    --card2: #1a2436;
+    --border: rgba(148, 163, 184, 0.18);
+    --text: #f8fafc;
+    --dim: #94a3b8;
+    --blue: #0088ff;
+    --cyan: #00d4ff;
+    --green: #2fd27a;
+    --amber: #ffb020;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 18px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; }
+  .head {
+    padding: 16px 18px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  }
+  .head h1 { font-size: 18px; letter-spacing: 0.5px; }
+  .badge {
+    font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+    background: var(--card2); border: 1px solid var(--border);
+  }
+  .badge.ok { color: var(--green); border-color: rgba(47, 210, 122, 0.45); }
+  .badge.warn { color: var(--amber); border-color: rgba(255, 176, 32, 0.45); }
+  .panel {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 14px;
+  }
+  .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--cyan); margin-bottom: 12px; }
+  label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  input, select {
+    width: 100%; padding: 11px 13px; border-radius: 10px; border: 1px solid var(--border);
+    background: #090e1a; color: #fff; font-size: 15px; margin-bottom: 12px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--cyan); }
+  .btn {
+    width: 100%; padding: 12px 16px; border-radius: 10px; border: none;
+    background: var(--blue); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer;
+  }
+  .btn:active { opacity: 0.85; }
+  .cmd-row { display: flex; gap: 8px; }
+  .cmd-row input { margin-bottom: 0; flex: 1; }
+  .cmd-row .btn { width: auto; padding: 11px 18px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+  .chip {
+    font-size: 12.5px; padding: 5px 11px; border-radius: 999px;
+    background: var(--card2); border: 1px solid var(--border); color: #cbd5e1; cursor: pointer;
+  }
+  .result {
+    margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+    background: rgba(0, 136, 255, 0.08); border: 1px solid rgba(0, 136, 255, 0.3);
+    font-size: 14.5px; font-weight: 600;
+  }
+  .meta { font-size: 12.5px; color: var(--dim); margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <div>
+      <h1>TRỢ LÝ GIỌNG NÓI BMW</h1>
+      <div style="font-size:12.5px;color:var(--dim)" id="busInfo">Đang kiểm tra kết nối đầu xe MGU…</div>
+    </div>
+    <span class="badge warn" id="keyBadge">Chưa cài Key</span>
+  </div>
+
+  <div class="panel">
+    <h2>1. Cấu hình Gemini API Key &amp; Nút Mic Vô-lăng</h2>
+    <label>Gemini API Key (dùng để giải mã giọng nói Tiếng Việt từ Mic trần xe):</label>
+    <input type="password" id="apiKey" placeholder="AIzaSy...">
+
+    <label>Cách gọi trên nút Mic vô-lăng:</label>
+    <select id="pttTrigger">
+      <option value="short_press">Bấm nút Mic vô-lăng (mặc định như zin BMW)</option>
+      <option value="long_press">Nhấn giữ nút Mic vô-lăng &gt; 0.6 giây</option>
+      <option value="double_press">Bấm đúp 2 lần nút Mic vô-lăng</option>
+    </select>
+
+    <button class="btn" onclick="saveSettings()">Lưu cấu hình</button>
+    <div class="meta" id="saveNotice"></div>
+  </div>
+
+  <div class="panel">
+    <h2>2. Thử lệnh nhanh</h2>
+    <div class="cmd-row">
+      <input id="askInput" placeholder="Ví dụ: Điều hoà 22 độ, Đèn viền màu cam..." onkeydown="if(event.key==='Enter')sendCmd()">
+      <button class="btn" onclick="sendCmd()">Gửi</button>
+    </div>
+    <div class="chips">
+      <span class="chip" onclick="sendCmd('Điều hoà 22 độ mức gió 3')">Điều hoà 22°C · Gió 3</span>
+      <span class="chip" onclick="sendCmd('Làm mát ghế tài mức 2')">Làm mát ghế mức 2</span>
+      <span class="chip" onclick="sendCmd('Đèn viền màu cam độ sáng 85%')">Đèn viền Cam 85%</span>
+      <span class="chip" onclick="sendCmd('Âm lượng 30%')">Âm lượng 30%</span>
+      <span class="chip" onclick="sendCmd('Bài tiếp theo')">Bài tiếp theo</span>
+      <span class="chip" onclick="sendCmd('Tình trạng xe')">Tình trạng xe</span>
+    </div>
+    <div class="result" id="lastResult">Sẵn sàng nhận lệnh.</div>
+  </div>
+</div>
+
+<script>
+  var PIN = (new URLSearchParams(location.search)).get('pin') || '';
+
+  function api(path, method, body) {
+    var sep = path.indexOf('?') >= 0 ? '&' : '?';
+    return fetch(path + sep + 'pin=' + encodeURIComponent(PIN), {
+      method: method || 'GET',
+      headers: { 'Content-Type': 'application/json', 'x-bmw-pin': PIN },
+      body: body ? JSON.stringify(body) : undefined
+    }).then(function(r) { return r.json(); });
+  }
+
+  function render(s) {
+    if (!s) return;
+    var kb = document.getElementById('keyBadge');
+    if (s.settings && s.settings.hasApiKey) {
+      kb.textContent = 'Đã cài Key: ' + s.settings.apiKeyMasked;
+      kb.className = 'badge ok';
+    } else {
+      kb.textContent = 'Chưa cài Key';
+      kb.className = 'badge warn';
+    }
+    if (document.activeElement !== document.getElementById('pttTrigger') && s.settings) {
+      document.getElementById('pttTrigger').value = s.settings.pttTrigger || 'short_press';
+    }
+    var car = s.car || {};
+    var aud = s.audio || {};
+    document.getElementById('busInfo').textContent =
+      (car.liveCar ? ('Đã kết nối xe BMW (' + car.proxyCount + ' kênh SOME/IP)') : 'Chế độ mô phỏng') +
+      (aud.hasAlsaCapture ? (' · Mic: ' + aud.device.split(':').pop()) : '');
+    if (s.lastTurn && s.lastTurn.replyVi) {
+      var pre = s.lastTurn.transcript ? ('“' + s.lastTurn.transcript + '” → ') : '';
+      document.getElementById('lastResult').textContent = pre + s.lastTurn.replyVi;
+    }
+  }
+
+  function saveSettings() {
+    var body = { pttTrigger: document.getElementById('pttTrigger').value };
+    var k = document.getElementById('apiKey').value.trim();
+    if (k) body.apiKey = k;
+    api('/api/settings', 'POST', body).then(function(r) {
+      if (r.ok) {
+        document.getElementById('apiKey').value = '';
+        document.getElementById('saveNotice').textContent = '✓ Đã lưu cấu hình thành công! Có thể đóng trang này và bấm nút Mic vô-lăng.';
+        render(r.state);
+      }
+    });
+  }
+
+  function sendCmd(txt) {
+    var inp = document.getElementById('askInput');
+    var q = txt !== undefined ? txt : inp.value.trim();
+    if (!q) return;
+    if (txt === undefined) inp.value = '';
+    document.getElementById('lastResult').textContent = 'Đang thực thi…';
+    api('/api/ask', 'POST', { text: q }).then(function(r) {
+      if (r.ok) render(r.state);
+    });
+  }
+
+  function refresh() {
+    api('/api/state', 'GET').then(function(r) { if (r.ok) render(r.state); }).catch(function() {});
+  }
+  refresh();
+  setInterval(refresh, 2500);
+</script>
+</body>
+</html>
