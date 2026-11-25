@@ -64,7 +64,8 @@ function cleanAtlasText(s) {
     return String(s || '')
         .replace(/[\u201c\u201d\u201e\u00ab\u00bb]/g, '"')
         .replace(/[\u2018\u2019]/g, "'")
-        .replace(/[\u2014\u2013]/g, '-');
+        .replace(/[\u2014\u2013]/g, '-')
+        .replace(/\u2022/g, '*');
 }
 
 function frameMsg(type, payload) {
@@ -111,6 +112,7 @@ class FontBank {
                 const j = JSON.parse(fs.readFileSync(p, 'utf8'));
                 const fam = (j.sizes || []).map((s) => ({
                     family: name,
+                    cacheKey: j.cacheKey || '',
                     size: s.size,
                     ascent: s.ascent,
                     descent: s.descent,
@@ -456,7 +458,10 @@ class IpaOverlay {
         if (this.closed || this.retryTimer) return;
         this.retryTimer = setTimeout(() => {
             this.retryTimer = null;
-            if ( this.retryTimer === null && !this.closed ) this._connectNext(0);
+            if (!this.closed) {
+                this.sockIdx = (this.sockIdx + 1) & 1023;
+                this._connectNext(this.sockIdx);
+            }
         }, ms);
         if (this.retryTimer.unref) this.retryTimer.unref();
     }
@@ -545,14 +550,14 @@ class IpaOverlay {
 
     _scheduleTopReassertions() {
         while (this.reassertTimers.length) clearTimeout(this.reassertTimers.pop());
-        // Recreate & re-show the Wayland IVI layer at +220ms and +540ms so HmiMain3D's system popup
-        // can never bury our BMW IPA overlay on CarPlay or background screens.
-        [220, 540].forEach((delayMs, idx) => {
+        // Recreate & re-show the Wayland IVI layer across +120ms, +280ms, +560ms, and +950ms so HmiMain3D's
+        // "Không khả dụng" system popup can never bury our BMW IPA overlay regardless of popup timing.
+        [120, 280, 560, 950].forEach((delayMs, idx) => {
             const t = setTimeout(() => {
                 if (this.phase === 'hidden' || !this.ready || !this.placed) return;
                 this._write(u32Msg(M.SHOW, [0]));
                 this.visible = false;
-                this._sendPlace(idx === 0 ? (this.box.w - 1) : this.box.w);
+                this._sendPlace((idx & 1) === 0 ? (this.box.w - 1) : this.box.w);
                 this._renderAndSend(true);
             }, delayMs);
             if (t.unref) t.unref();

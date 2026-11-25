@@ -21,7 +21,8 @@ function cleanText(s) {
     return String(s || '')
         .replace(/[\u201c\u201d\u201e\u00ab\u00bb]/g, '"')
         .replace(/[\u2018\u2019]/g, "'")
-        .replace(/[\u2014\u2013]/g, '-');
+        .replace(/[\u2014\u2013]/g, '-')
+        .replace(/\u2022/g, '*');
 }
 
 function fit(cv, str, size, o, max) {
@@ -120,7 +121,7 @@ function drawQrSetupScreen(cv, G, t, top, bottom, v, act) {
         const tw = boxW - (72 + qs) - 36;
 
         cv.text('CÀI ĐẶT TRỢ LÝ GIỌNG NÓI BMW', tx, boxY + 54, 24, t.text, { literal: true, font: 'bold' });
-        cv.text(hasKey ? ('Trạng thái: ĐÃ CÀI GEMINI API KEY (' + (v.settings.apiKeyMasked || 'Sẵn sàng') + ')') : 'Trạng thái: CHƯA DÁN GEMINI API KEY',
+        cv.text(hasKey ? ('Trạng thái: ĐÃ CÀI GEMINI API KEY (' + cleanText(v.settings.apiKeyMasked || 'Sẵn sàng') + ')') : 'Trạng thái: CHƯA DÁN GEMINI API KEY',
             tx, boxY + 90, 17, hasKey ? '#2fd27a' : '#ffb020', { literal: true, font: 'bold' });
 
         cv.text('1. Kết nối điện thoại cùng mạng Wi-Fi / Hotspot với đầu xe MGU.', tx, boxY + 132, 16, t.dim, { literal: true, font: 'label' });
@@ -203,8 +204,8 @@ function draw(cv, G, t, v, act) {
     const amb = car.ambient || {};
     const med = car.media || {};
 
-    cv.text('TRỢ LÝ GIỌNG NÓI BMW', rx, top + 32, 28, t.text, { literal: true, font: 'bold', spacing: 1.5 });
-    G.stripes(cv, t, rx, top + 42, 168);
+    cv.text('TRỢ LÝ GIỌNG NÓI BMW', rx, top + 30, 28, t.text, { literal: true, font: 'bold', spacing: 1.5 });
+    G.stripes(cv, t, rx, top + 45, 168);
 
     // Main OEM Confirmation Box
     const boxY = top + 64, boxH = 148;

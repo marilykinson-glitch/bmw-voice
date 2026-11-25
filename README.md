@@ -1,4 +1,4 @@
-# Trợ lý BMW (`bmw-voice` `v1.1.1`)
+# Trợ lý BMW (`bmw-voice` `v1.1.2`)
 
 Thay thế trình **BMW Intelligent Personal Assistant (IPA)** nguyên bản bằng Tiếng Việt cho đầu **BMW MGU iDrive 7 (`SP18`)**:
 
@@ -29,6 +29,6 @@ Thay thế trình **BMW Intelligent Personal Assistant (IPA)** nguyên bản b�
 ## Cài Đặt Trên MGU Store
 
 1. Thêm nguồn GitHub vào **MGU Store → Settings → Sources**: `marilykinson-glitch/bmw-voice` (nhánh `main`).
-2. Cài đặt ứng dụng **Trợ lý BMW** (`bmw_voice` — Store sẽ tự cài dịch vụ nền `bmw-voice` `1.1.1`).
+2. Cài đặt ứng dụng **Trợ lý BMW** (`bmw_voice` — Store sẽ tự cài dịch vụ nền `bmw-voice` `1.1.2`).
 3. Mở **Trợ lý BMW** trên xe lần đầu, quét mã **QR** bằng điện thoại để dán **Gemini API Key** và bấm **Lưu cấu hình**.
 4. Từ lúc đó trở đi, không cần mở lại app nữa — đang chạy CarPlay hay ở bất kỳ đâu chỉ cần nói **"Hey BMW"** hoặc **bấm nút Mic trên vô-lăng** là dùng như nguyên bản!

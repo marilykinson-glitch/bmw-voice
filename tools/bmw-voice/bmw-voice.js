@@ -30,7 +30,7 @@ const MicCapture = require('./mic-capture');
 const NluBrain = require('./nlu-brain');
 const { IpaOverlay } = require('./ipa-overlay');
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 const FW_TAG = 'bmw-voice';
 const APP_RE = /^bmw_voice\d*$/;
 
@@ -294,7 +294,7 @@ class BmwVoiceDaemon {
         return {
             hasApiKey: !!this.settings.apiKey,
             apiKeyMasked: this.settings.apiKey
-                ? (this.settings.apiKey.slice(0, 6) + '••••' + this.settings.apiKey.slice(-4))
+                ? (this.settings.apiKey.slice(0, 6) + '****' + this.settings.apiKey.slice(-4))
                 : '',
             model: this.settings.model,
             pttTrigger: this.settings.pttTrigger,
@@ -803,8 +803,18 @@ class BmwVoiceDaemon {
             return { ok: true };
         }
         if (cmd === 'app_visible') {
-            this.hmiAppVisible = !!(arg && arg.visible);
-            if (this.hmiAppVisible) this.overlay.hide();
+            const nextVis = !!(arg && arg.visible);
+            this.hmiAppVisible = nextVis;
+            if (nextVis) {
+                this.overlay.hide();
+            } else if (this.shouldShowOverlay()) {
+                // If an HMI popup ("Không khả dụng") temporarily stole focus from MAIN, immediately cover it with IpaOverlay!
+                if (this.assistantState === 'listening') {
+                    this.overlay.showListening({ reassertTop: true, speakerZone: this.lastTurn.speakerZone || 'driver' });
+                } else if (this.assistantState === 'thinking') {
+                    this.overlay.showThinking({ speakerZone: this.lastTurn.speakerZone || 'driver' });
+                }
+            }
             return { ok: true };
         }
         if (cmd === 'ptt_trigger') return this.captureAndExecute({ fromSteeringWheel: false });

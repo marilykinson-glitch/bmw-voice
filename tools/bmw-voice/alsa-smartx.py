@@ -541,7 +541,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
             if calib_count < 6:
                 if db > -85.0:
                     floor_db = db if calib_count == 0 else (floor_db * 0.72 + db * 0.28)
-                    floor_db = max(-62.0, min(-30.0, floor_db))
+                    floor_db = max(-62.0, min(-22.0, floor_db))
                     if hw_ch >= 3 and ref_db > -35.0:
                         echo_offset_db = max(-22.0, min(6.0, db - ref_db))
                     calib_count += 1
@@ -567,9 +567,9 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     if db > -85.0:
                         # Fast downward recovery so transient noise never deafens "Hey BMW"
                         if db < floor_db:
-                            floor_db = max(-62.0, min(-30.0, floor_db * 0.70 + db * 0.30))
+                            floor_db = max(-62.0, min(-22.0, floor_db * 0.70 + db * 0.30))
                         else:
-                            floor_db = max(-62.0, min(-30.0, floor_db * 0.96 + db * 0.04))
+                            floor_db = max(-62.0, min(-22.0, floor_db * 0.96 + db * 0.04))
                     if music_playing and db > -75.0:
                         echo_offset_db = max(-22.0, min(6.0, echo_offset_db * 0.95 + (db - ref_db) * 0.05))
             else:

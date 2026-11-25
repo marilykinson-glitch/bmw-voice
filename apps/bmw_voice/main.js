@@ -39,6 +39,7 @@ mgu.run({
         let pushSock = null;
         let pushBuf = '';
         let pushRetryTimer = null;
+        let frontReportTimer = null;
         let autoOpenedByVoice = false;
         let autoCloseTimer = null;
         let reopenGuardTimer = null;
@@ -50,6 +51,12 @@ mgu.run({
 
         function isMainVisible() {
             return !!(ui.isVisible && ui.isVisible('MAIN'));
+        }
+
+        // Only report `visible: true` to daemon when MAIN is BOTH visible AND unfocused-free (not covered by
+        // HmiMain3D's "Không khả dụng" popup, where display.js hides the app's GPU layer!).
+        function isMainUnobscured() {
+            return isMainVisible() && (!ui.hasFocus || ui.hasFocus('MAIN'));
         }
 
         function closeIfAutoOpened() {
@@ -147,7 +154,7 @@ mgu.run({
             s.on('connect', () => {
                 if (s.setNoDelay) s.setNoDelay(true);
                 try {
-                    s.write(JSON.stringify({ id: ++cmdId, cmd: 'subscribe_hmi', arg: { visible: isMainVisible() } }) + '\n');
+                    s.write(JSON.stringify({ id: ++cmdId, cmd: 'subscribe_hmi', arg: { visible: isMainUnobscured() } }) + '\n');
                 } catch (e) {}
             });
             s.on('data', (chunk) => {
@@ -176,6 +183,22 @@ mgu.run({
                 connectPushStream();
             }, 3500);
             if (pushRetryTimer.unref) pushRetryTimer.unref();
+        }
+
+        function syncFrontVisibilityReport() {
+            if (frontReportTimer) { clearTimeout(frontReportTimer); frontReportTimer = null; }
+            const unobscured = isMainUnobscured();
+            if (!unobscured) {
+                // Report false immediately so IpaOverlay (`uid=0`) covers any HmiMain3D popup with zero gap!
+                notifyVisibility(false);
+                return;
+            }
+            // Wait 380ms (`display.js` SHOW_DELAY_MS is 350ms) before telling IpaOverlay to yield!
+            frontReportTimer = setTimeout(() => {
+                frontReportTimer = null;
+                if (isMainUnobscured()) notifyVisibility(true);
+            }, 380);
+            if (frontReportTimer.unref) frontReportTimer.unref();
         }
 
         function notifyVisibility(vis) {
@@ -376,7 +399,7 @@ mgu.run({
         if (ui.onVisible) {
             ui.onVisible((name, vis) => {
                 if (name === 'MAIN') {
-                    notifyVisibility(vis);
+                    syncFrontVisibilityReport();
                     if (!vis) {
                         autoOpenedByVoice = false;
                         clearVoicePopTimers();
@@ -386,6 +409,11 @@ mgu.run({
                 }
             });
         }
+        if (ui.onFocus) {
+            ui.onFocus((name) => {
+                if (name === 'MAIN') syncFrontVisibilityReport();
+            });
+        }
         syncPollTimer(isMainVisible());
 
         ['BTN_MIC', 'BTN_QR'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
@@ -393,6 +421,6 @@ mgu.run({
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.1.1 ready');
+        log.info('bmw_voice v1.1.2 ready');
     },
 });

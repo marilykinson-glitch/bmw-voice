@@ -49,7 +49,7 @@ async function runTests() {
 
         const comp = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'component.json'), 'utf8'));
         assert.strictEqual(comp.id, 'bmw-voice');
-        assert.strictEqual(comp.version, '1.1.1');
+        assert.strictEqual(comp.version, '1.1.2');
         assert.strictEqual(comp.enable[0].target, 'oapcontroller.service');
         assert.deepStrictEqual(comp.recmgr, ['bmw-voice']);
 
@@ -58,11 +58,11 @@ async function runTests() {
         });
 
         const appSpec = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'bmw_voice', 'app.json'), 'utf8'));
-        assert.strictEqual(appSpec.version, '1.1.1');
+        assert.strictEqual(appSpec.version, '1.1.2');
         assert.strictEqual(appSpec.startType, 'autostart');
 
         const repoSpec = JSON.parse(fs.readFileSync(path.join(root, 'mgu-repo.json'), 'utf8'));
-        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.1.1');
+        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.1.2');
 
         const py = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'alsa-smartx.py'), 'utf8');
         assert.strictEqual(py.indexOf('SND_PCM_STREAM_PLAYBACK'), -1);
