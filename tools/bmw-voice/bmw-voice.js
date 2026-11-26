@@ -30,7 +30,7 @@ const MicCapture = require('./mic-capture');
 const NluBrain = require('./nlu-brain');
 const { IpaOverlay } = require('./ipa-overlay');
 
-const VERSION = '1.1.2';
+const VERSION = '1.2.0';
 const FW_TAG = 'bmw-voice';
 const APP_RE = /^bmw_voice\d*$/;
 
@@ -74,7 +74,7 @@ function writeAtomic(file, data, mode) {
 function defaultSettings() {
     return {
         apiKey: '',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-2.5-flash',
         pttTrigger: 'short_press', // short_press | long_press | double_press | disabled
         handsFreeWake: true,       // "Hey BMW" hands-free wake word enabled by default
         swapMicChannels: false,
@@ -84,7 +84,7 @@ function defaultSettings() {
 function normalizeModelName(raw, fallback) {
     const m = typeof raw === 'string' ? raw.trim() : '';
     if (!m) return fallback;
-    if (/^gemini-(?:1\.5|2\.0|2\.5)-flash(?:-lite)?$/i.test(m)) return 'gemini-3-flash-preview';
+    if (/^gemini-1\.5-/i.test(m) || /^gemini-3-flash-preview$/i.test(m)) return 'gemini-2.5-flash';
     return m;
 }
 
@@ -198,6 +198,8 @@ class BmwVoiceDaemon {
         this.hmiClients = [];
         this.hmiAppVisible = false;
         this.turnBusy = false;
+        this.wakeCheckBusy = false;
+        this.wakeEpoch = 0;
         this.listenStartedAt = 0;
         this.statusTimer = null;
         this.busInitTimer = null;
@@ -409,13 +411,15 @@ class BmwVoiceDaemon {
     }
 
     async onHeyBmwCandidate(utt) {
-        if (this.turnBusy || this.assistantState !== 'idle') return;
+        if (this.turnBusy || this.wakeCheckBusy || this.assistantState !== 'idle') return;
         if (!this.settings.handsFreeWake || !this.settings.apiKey || this.car.state.callActive) return;
 
-        this.turnBusy = true;
+        const myEpoch = ++this.wakeEpoch;
+        this.wakeCheckBusy = true;
+        let turn = null;
+        const zone = (utt.analysis && utt.analysis.speakerZone === 'passenger') ? 'passenger' : 'driver';
         try {
-            const zone = (utt.analysis && utt.analysis.speakerZone === 'passenger') ? 'passenger' : 'driver';
-            const turn = await NluBrain.processVoiceOrText({
+            turn = await NluBrain.processVoiceOrText({
                 audioWavBase64: utt.wavBuffer.toString('base64'),
                 audioMimeType: 'audio/wav',
                 speakerZone: zone,
@@ -425,16 +429,29 @@ class BmwVoiceDaemon {
                 carController: this.car,
                 uplinkOpts: this.uplinkOpts,
             });
+        } finally {
+            this.wakeCheckBusy = false;
+        }
 
-            if (turn && turn.netError) {
-                this.log('Hey BMW network warn: ' + turn.netError);
+        if (turn && turn.netError) {
+            this.log('Hey BMW network warn: ' + turn.netError);
+            if (turn.httpStatus === 429 || /\b429\b/.test(turn.netError)) {
+                this.micStream.holdCooldown(35000);
             }
+        }
 
-            // 1. Cabin chatter without "Hey BMW" -> silently ignore (zero UI popups, zero status churn)
-            if (!turn || turn.ignored) {
-                return;
-            }
+        // Preempted by physical Steering Wheel Mic button or manual UI Mic button while wake check was in flight!
+        if (myEpoch !== this.wakeEpoch || this.turnBusy || this.assistantState !== 'idle') {
+            return;
+        }
 
+        // 1. Cabin chatter without "Hey BMW" -> silently ignore (zero UI popups, zero status churn)
+        if (!turn || turn.ignored) {
+            return;
+        }
+
+        this.turnBusy = true;
+        try {
             this.micLevels = {
                 leftDb: utt.analysis ? utt.analysis.leftDb : -30,
                 rightDb: utt.analysis ? utt.analysis.rightDb : -30,
@@ -540,6 +557,8 @@ class BmwVoiceDaemon {
 
     async captureAndExecute(opts) {
         const o = opts || {};
+        // Always preempt any background Hey BMW check so Steering Wheel PTT responds 100% of the time!
+        this.wakeEpoch++;
         if (this.turnBusy || this.assistantState !== 'idle') {
             return { ok: false, error: 'Đang xử lý lệnh trước' };
         }
@@ -554,6 +573,13 @@ class BmwVoiceDaemon {
             };
             this.writeStatusFile(true);
             return { ok: false, turn: this.lastTurn };
+        }
+
+        // Physical Steering Wheel Mic press ALWAYS triggers HmiMain3D's native Speech scene transition (~100-300ms later),
+        // even if `Trợ lý BMW` was already open on screen! Reset `hmiAppVisible = false` up front so `IpaOverlay` (`uid=0`)
+        // shields the screen immediately at t=0ms until `apps/bmw_voice` reclaims `ROOT_APP` in `HmiMain3D`!
+        if (o.fromSteeringWheel) {
+            this.hmiAppVisible = false;
         }
 
         const hasKey = !!this.settings.apiKey;

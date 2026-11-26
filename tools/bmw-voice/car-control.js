@@ -353,9 +353,13 @@ class CarController {
         const fire = () => {
             this.callMethodIfAvailable('speechPrompter', 'abortPrompt', {}).catch(() => {});
             this.callMethodIfAvailable('voicePrompt', 'abort', {}).catch(() => {});
+            this.callMethodIfAvailable('speechDialog', 'abortDialog', {}).catch(() => {});
+            this.callMethodIfAvailable('speechDialog', 'abort', {}).catch(() => {});
+            this.callMethodIfAvailable('speechDialog', 'cancelDialog', {}).catch(() => {});
+            this.callMethodIfAvailable('speechDialog', 'stopDialog', {}).catch(() => {});
         };
         fire();
-        [70, 200, 420].forEach((ms) => {
+        [70, 180, 360, 650].forEach((ms) => {
             const t = setTimeout(fire, ms);
             if (t.unref) t.unref();
         });
@@ -590,7 +594,8 @@ class CarController {
             this.handleSteeringPttSignal(pressed);
         });
 
-        addBinding('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v, isInitialRead) => {
+        addBinding('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'],
+            ['abortDialog', 'abort', 'cancelDialog', 'stopDialog'], (f, v, isInitialRead) => {
             if (v === null || v === undefined) return;
             const prev = this.lastSpeechDialogState;
             this.lastSpeechDialogState = v;

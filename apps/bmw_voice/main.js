@@ -40,27 +40,60 @@ mgu.run({
         let pushBuf = '';
         let pushRetryTimer = null;
         let frontReportTimer = null;
+        let voiceSessionActive = false;
         let autoOpenedByVoice = false;
         let autoCloseTimer = null;
-        let reopenGuardTimer = null;
+        let counterReclaimTimer = null;
+        const reopenWaveTimers = [];
+
+        function clearReclaimTimers() {
+            while (reopenWaveTimers.length) {
+                clearTimeout(reopenWaveTimers.pop());
+            }
+            if (counterReclaimTimer) {
+                clearTimeout(counterReclaimTimer);
+                counterReclaimTimer = null;
+            }
+        }
 
         function clearVoicePopTimers() {
             if (autoCloseTimer) { clearTimeout(autoCloseTimer); autoCloseTimer = null; }
-            if (reopenGuardTimer) { clearTimeout(reopenGuardTimer); reopenGuardTimer = null; }
+            clearReclaimTimers();
         }
 
         function isMainVisible() {
             return !!(ui.isVisible && ui.isVisible('MAIN'));
         }
 
-        // Only report `visible: true` to daemon when MAIN is BOTH visible AND unfocused-free (not covered by
-        // HmiMain3D's "Không khả dụng" popup, where display.js hides the app's GPU layer!).
+        // Only report `visible: true` to daemon when MAIN is visible, ROOT_APP is in front, AND unfocused-free!
         function isMainUnobscured() {
-            return isMainVisible() && (!ui.hasFocus || ui.hasFocus('MAIN'));
+            const rootOk = !ui.isRootInFront || ui.isRootInFront();
+            const focusOk = !ui.hasFocus || ui.hasFocus('MAIN');
+            return isMainVisible() && rootOk && focusOk;
+        }
+
+        function reclaimHmiScreen() {
+            if (ctx.openApp) ctx.openApp({ force: true });
+        }
+
+        function scheduleReclaimWaves() {
+            clearReclaimTimers();
+            // Fire multi-stage openEntryState waves across +140..+1050ms so whether HmiMain3D opens
+            // "Không khả dụng" at +100ms, +250ms, or +500ms after PTT, our RHMI entry immediately replaces it!
+            [140, 340, 640, 1050].forEach((ms) => {
+                const t = setTimeout(() => {
+                    if ((voiceSessionActive || autoOpenedByVoice) && !isMainUnobscured()) {
+                        reclaimHmiScreen();
+                    }
+                }, ms);
+                if (t.unref) t.unref();
+                reopenWaveTimers.push(t);
+            });
         }
 
         function closeIfAutoOpened() {
             clearVoicePopTimers();
+            voiceSessionActive = false;
             if (autoOpenedByVoice && !showQr) {
                 autoOpenedByVoice = false;
                 if (ctx.closeApp) ctx.closeApp();
@@ -102,20 +135,16 @@ mgu.run({
             }
 
             if (ev.action === 'open' || ev.action === 'open_result') {
-                clearVoicePopTimers();
-                if (!isMainVisible() && ctx.openApp) {
-                    autoOpenedByVoice = true;
-                    ctx.openApp();
-                    // Re-assert once at +260ms so if HmiMain3D opened "Không khả dụng" slightly after PTT,
-                    // our native RHMI entry replaces it immediately.
-                    reopenGuardTimer = setTimeout(() => {
-                        reopenGuardTimer = null;
-                        if (autoOpenedByVoice && (!isMainVisible() || (ui.hasFocus && !ui.hasFocus('MAIN'))) && ctx.openApp) {
-                            ctx.openApp();
-                        }
-                    }, 260);
-                    if (reopenGuardTimer.unref) reopenGuardTimer.unref();
+                if (autoCloseTimer) { clearTimeout(autoCloseTimer); autoCloseTimer = null; }
+                if (!voiceSessionActive) {
+                    autoOpenedByVoice = !isMainUnobscured();
+                    voiceSessionActive = true;
                 }
+                // UNCONDITIONALLY reclaim HMI screen & schedule waves even if MAIN was already visible before PTT,
+                // because HmiMain3D jumps to "Không khả dụng" ~100-350ms AFTER physical Steering Wheel Mic press!
+                reclaimHmiScreen();
+                scheduleReclaimWaves();
+
                 if (ev.action === 'open_result') {
                     const hold = Math.max(1500, Number(ev.holdMs) || 3200);
                     autoCloseTimer = setTimeout(() => {
@@ -125,7 +154,13 @@ mgu.run({
                     if (autoCloseTimer.unref) autoCloseTimer.unref();
                 }
             } else if (ev.action === 'finish') {
-                if (reopenGuardTimer) { clearTimeout(reopenGuardTimer); reopenGuardTimer = null; }
+                const endSessionTimer = setTimeout(() => {
+                    voiceSessionActive = false;
+                    clearReclaimTimers();
+                }, 420);
+                if (endSessionTimer.unref) endSessionTimer.unref();
+                if (!isMainUnobscured()) reclaimHmiScreen();
+
                 if (autoOpenedByVoice && !showQr) {
                     if (autoCloseTimer) clearTimeout(autoCloseTimer);
                     const hold = Math.max(1500, Number(ev.holdMs) || 3200);
@@ -401,8 +436,19 @@ mgu.run({
                 if (name === 'MAIN') {
                     syncFrontVisibilityReport();
                     if (!vis) {
-                        autoOpenedByVoice = false;
-                        clearVoicePopTimers();
+                        if (voiceSessionActive) {
+                            // HmiMain3D just jumped to "Không khả dụng" mid-voice-turn! Counter-reclaim immediately!
+                            if (!counterReclaimTimer) {
+                                counterReclaimTimer = setTimeout(() => {
+                                    counterReclaimTimer = null;
+                                    if (voiceSessionActive && !isMainUnobscured()) reclaimHmiScreen();
+                                }, 55);
+                                if (counterReclaimTimer.unref) counterReclaimTimer.unref();
+                            }
+                        } else {
+                            autoOpenedByVoice = false;
+                            clearVoicePopTimers();
+                        }
                     }
                     syncPollTimer(vis);
                     if (vis) repaint(true);
@@ -410,8 +456,17 @@ mgu.run({
             });
         }
         if (ui.onFocus) {
-            ui.onFocus((name) => {
-                if (name === 'MAIN') syncFrontVisibilityReport();
+            ui.onFocus((name, on) => {
+                if (name === 'MAIN') {
+                    syncFrontVisibilityReport();
+                    if (!on && voiceSessionActive && !counterReclaimTimer) {
+                        counterReclaimTimer = setTimeout(() => {
+                            counterReclaimTimer = null;
+                            if (voiceSessionActive && !isMainUnobscured()) reclaimHmiScreen();
+                        }, 55);
+                        if (counterReclaimTimer.unref) counterReclaimTimer.unref();
+                    }
+                }
             });
         }
         syncPollTimer(isMainVisible());
@@ -421,6 +476,6 @@ mgu.run({
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.1.2 ready');
+        log.info('bmw_voice v1.2.0 ready');
     },
 });

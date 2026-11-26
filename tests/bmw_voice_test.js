@@ -36,10 +36,10 @@ async function runTests() {
         console.log('  [PASS] ' + name);
     });
 
-    console.log('Running bmw-voice v1.1.1 test suite...');
+    console.log('Running bmw-voice v1.2.0 test suite...');
 
     // 1. MGU Boot Safety, Systemd, Bundled Vietnamese Fonts & Read-Only ALSA Capture Invariants
-    await step('Systemd service, component.json v1.1.1, bundled Inter fonts & ALSA capture-only invariants', () => {
+    await step('Systemd service, component.json v1.2.0, bundled Inter fonts & ALSA capture-only invariants', () => {
         const root = path.resolve(__dirname, '..');
         const svc = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'bmw-voice.service'), 'utf8');
         assert.ok(svc.indexOf('WantedBy=oapcontroller.service') >= 0);
@@ -49,7 +49,7 @@ async function runTests() {
 
         const comp = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'component.json'), 'utf8'));
         assert.strictEqual(comp.id, 'bmw-voice');
-        assert.strictEqual(comp.version, '1.1.2');
+        assert.strictEqual(comp.version, '1.2.0');
         assert.strictEqual(comp.enable[0].target, 'oapcontroller.service');
         assert.deepStrictEqual(comp.recmgr, ['bmw-voice']);
 
@@ -58,11 +58,11 @@ async function runTests() {
         });
 
         const appSpec = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'bmw_voice', 'app.json'), 'utf8'));
-        assert.strictEqual(appSpec.version, '1.1.2');
+        assert.strictEqual(appSpec.version, '1.2.0');
         assert.strictEqual(appSpec.startType, 'autostart');
 
         const repoSpec = JSON.parse(fs.readFileSync(path.join(root, 'mgu-repo.json'), 'utf8'));
-        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.1.2');
+        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.2.0');
 
         const py = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'alsa-smartx.py'), 'utf8');
         assert.strictEqual(py.indexOf('SND_PCM_STREAM_PLAYBACK'), -1);
@@ -529,7 +529,183 @@ async function runTests() {
         assert.strictEqual(b1.equals(b2), true);
     });
 
-    console.log('\nALL ' + passed + ' BMW-VOICE v1.1.1 TEST SUITES PASSED!');
+    // 8. Real-Car Regression #3 (`07:39` Morning Traffic): Road Rumble Filter + 5-Model HTTP 429 Failover + PTT Preemption
+    await step('Rejects <180Hz truck rumble in alsa-smartx.py, cascades past Gemini HTTP 429 & preempts wake on PTT', async () => {
+        const cp = require('child_process');
+        const root = path.resolve(__dirname, '..');
+        const smartxPath = path.join(root, 'tools', 'bmw-voice', 'alsa-smartx.py');
+
+        // A) Verify Python speech-band filter crushes 75 Hz container-truck rumble while passing 1300 Hz speech syllables
+        const pyCheck = cp.spawnSync('python3', ['-c', [
+            'import array, importlib.util, json, math',
+            'spec = importlib.util.spec_from_file_location("smartx", ' + JSON.stringify(smartxPath) + ')',
+            'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+            'sr = 24000; n = sr',
+            // Loud 75 Hz truck rumble burst (amp 14000) vs quieter 1300 Hz speech syllables (amp 3500)
+            'rumble = array.array("h", [int(14000 * math.sin(2*math.pi*75*i/sr) * (1.0 if 0.2 < i/sr < 0.7 else 0.25)) for i in range(n)])',
+            'speech = array.array("h", [int(3500 * math.sin(2*math.pi*1300*i/sr) * (1.0 if (0.15 < i/sr < 0.42 or 0.50 < i/sr < 0.78) else 0.02)) for i in range(n)])',
+            'rdb, rpk, rzcr = m._speech_band_db_peak_zcr(rumble.tobytes(), 1)',
+            'sdb, spk, szcr = m._speech_band_db_peak_zcr(speech.tobytes(), 1)',
+            '_, _, _, r_fpeak, r_snr = m._condition_and_boost_pcm(rumble.tobytes(), 1, sr)',
+            '_, _, _, s_fpeak, s_snr = m._condition_and_boost_pcm(speech.tobytes(), 1, sr)',
+            'print(json.dumps({"rdb": rdb, "sdb": sdb, "r_snr": r_snr, "s_snr": s_snr, "s_fpeak": s_fpeak}))',
+        ].join('\n')], { encoding: 'utf8' });
+        assert.strictEqual(pyCheck.status, 0, pyCheck.stderr);
+        const dsp = JSON.parse(pyCheck.stdout.trim());
+        assert.ok(dsp.sdb > dsp.rdb + 8.0, '1300Hz speech must score >8dB above 4x louder 75Hz truck rumble: ' + JSON.stringify(dsp));
+        assert.ok(dsp.s_snr >= 12.0 && dsp.s_fpeak >= 15000, 'speech syllables must pass SNR & auto-gain cleanly');
+
+        // B) Verify 5-Model Quota Cascade transparently recovers from HTTP 429 on first 2 models within SAME turn
+        NluBrain.resetModelCooldowns();
+        const hitModels = [];
+        const cascadeGem = http.createServer((req, res) => {
+            req.on('data', () => {});
+            req.on('end', () => {
+                const mMatch = /\/models\/([^:?]+):generateContent/.exec(req.url || '');
+                const modName = mMatch ? decodeURIComponent(mMatch[1]) : 'unknown';
+                hitModels.push(modName);
+                if (hitModels.length <= 2) {
+                    res.writeHead(429, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { code: 429, message: 'Quota exceeded' } }));
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    candidates: [{
+                        content: {
+                            parts: [{
+                                text: JSON.stringify({
+                                    speechDetected: true,
+                                    transcript: 'Điều hoà 21 độ',
+                                    toolCalls: [{ name: 'set_climate', args: { tempC: 21, zone: 'driver' } }],
+                                }),
+                            }],
+                        },
+                    }],
+                }));
+            });
+        });
+        await new Promise((r) => cascadeGem.listen(0, '127.0.0.1', r));
+
+        const car = new CarControl.CarController();
+        const wav = MicCapture.buildStereoWav(new Array(1600).fill(0.35), new Array(1600).fill(0.04), 16000);
+        const recoveredTurn = await NluBrain.processVoiceOrText({
+            audioWavBase64: wav.toString('base64'),
+            speakerZone: 'driver',
+            apiKey: 'AIzaSyQuotaCascadeKey',
+            model: 'gemini-3-flash-preview',
+            carController: car,
+            uplinkOpts: Up.options({ noSetuid: true, baseUrl: 'http://127.0.0.1:' + cascadeGem.address().port }),
+        });
+        assert.strictEqual(recoveredTurn.ok, true, 'must recover from HTTP 429 via secondary Gemini model!');
+        assert.strictEqual(car.state.climate.tempDriverC, 21.0);
+        assert.strictEqual(hitModels.length, 3);
+        assert.strictEqual(hitModels[0], 'gemini-3-flash-preview');
+        await new Promise((r) => cascadeGem.close(r));
+
+        // Also verify honest Vietnamese message when ALL models return 429 (never blame Wi-Fi/4G!)
+        const err429Msg = NluBrain.formatGeminiErrorVi(Object.assign(new Error('Gemini HTTP 429'), { httpStatus: 429 }));
+        assert.ok(err429Msg.indexOf('hạn mức') >= 0 || err429Msg.indexOf('giới hạn') >= 0);
+        assert.strictEqual(err429Msg.indexOf('Wi-Fi/4G'), -1);
+        NluBrain.resetModelCooldowns();
+
+        // C) Verify Steering Wheel PTT preempts slow in-flight wake check AND shows IpaOverlay even if app was open!
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bv-preempt-'));
+        const smartxDir = path.join(tmp, 'smartx');
+        fs.mkdirSync(smartxDir);
+        fs.writeFileSync(path.join(smartxDir, 'smartx_SpeechSink_CF_2MIC_6REF_c'), '');
+        const mockBin = path.join(tmp, 'mock-py.sh');
+        const mockHelper = path.join(tmp, 'mock-helper.js');
+        const sampleWavPath = path.join(tmp, 's.wav');
+        fs.writeFileSync(sampleWavPath, wav);
+        fs.writeFileSync(mockBin, '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "' + process.execPath + '" "$@"\n', { mode: 0o755 });
+        fs.writeFileSync(mockHelper, [
+            "'use strict';",
+            "const fs = require('fs'), path = require('path');",
+            "const workDir = process.argv[4], devName = process.argv[3];",
+            "process.stdout.write(JSON.stringify({ event: 'ready', device: devName }) + '\\n');",
+            "let buf = ''; process.stdin.setEncoding('utf8');",
+            "process.stdin.on('data', (c) => { buf += c; let i; while ((i = buf.indexOf('\\n')) >= 0) {",
+            "  const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);",
+            "  if (m.cmd === 'stop') process.exit(0);",
+            "  if (m.cmd === 'ptt') {",
+            "    const out = path.join(workDir, 'ptt_clip.wav'); fs.copyFileSync(" + JSON.stringify(sampleWavPath) + ", out);",
+            "    setTimeout(() => process.stdout.write(JSON.stringify({ event: 'ptt_clip', reqId: m.reqId, file: out, durationMs: 600, voicedChunks: 6, snrDb: 10, device: devName }) + '\\n'), 25);",
+            "  }",
+            "}});",
+        ].join('\n'), { mode: 0o755 });
+
+        let reqNum = 0;
+        const slowWakeGem = http.createServer((req, res) => {
+            req.on('data', () => {});
+            req.on('end', () => {
+                const cur = ++reqNum;
+                if (cur === 1) {
+                    // Slow wake check (450ms) that finishes AFTER Steering Wheel PTT was pressed!
+                    setTimeout(() => {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ speechDetected: false, wakeDetected: false, transcript: '' }) }] } }] }));
+                    }, 450);
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ speechDetected: true, transcript: 'Đèn viền màu xanh băng', toolCalls: [{ name: 'set_ambient_light', args: { color: 'cyan' } }] }) }] } }] }));
+            });
+        });
+        await new Promise((r) => slowWakeGem.listen(0, '127.0.0.1', r));
+
+        const ovSock = path.join(tmp, 'render.sock');
+        const ovSrv = net.createServer((c) => {
+            c.on('data', (d) => {
+                if (d.length >= 8 && d.readUInt32LE(0) === M.HELLO) c.write(buildRendererReadyMsg());
+            });
+        });
+        await new Promise((r) => ovSrv.listen(ovSock, r));
+
+        const dm = new BmwVoiceDaemon({
+            run: path.join(tmp, 'run'),
+            state: path.join(tmp, 'state'),
+            oap: path.join(tmp, 'oap'),
+            host: '127.0.0.1',
+            port: 0,
+            simMode: true,
+            noNft: true,
+            noOverlay: false,
+            renderSockets: [ovSock],
+            quiet: true,
+            geminiBaseUrl: 'http://127.0.0.1:' + slowWakeGem.address().port,
+            micOpts: { mguPython: mockBin, smartxHelper: mockHelper, smartxDir },
+        });
+        dm.saveSettings({ apiKey: 'AIzaSyPreemptKey1234', handsFreeWake: true });
+        await dm.start();
+        await new Promise((r) => setTimeout(r, 120));
+
+        // Simulate Photo 1: `Trợ lý BMW` was ALREADY open (`hmiAppVisible = true`), AND a slow wake check is in flight!
+        dm.hmiAppVisible = true;
+        const wakePromise = dm.onHeyBmwCandidate({ wavBuffer: wav, analysis: { speakerZone: 'driver', leftDb: -22, rightDb: -40 } });
+        await new Promise((r) => setTimeout(r, 40));
+        assert.strictEqual(dm.wakeCheckBusy, true);
+
+        // User presses Steering Wheel Mic button -> MUST preempt wake check & immediately raise IpaOverlay (`phase === 'listening'`)!
+        dm.car.handleSteeringPttSignal(true);
+        await new Promise((r) => setTimeout(r, 15));
+        assert.strictEqual(dm.hmiAppVisible, false, 'PTT must reset hmiAppVisible so IpaOverlay covers HmiMain3D speech scene!');
+        assert.strictEqual(dm.overlay.phase, 'listening', 'IpaOverlay must immediately shield screen on PTT!');
+
+        await wakePromise;
+        const deadline = Date.now() + 2500;
+        while (Date.now() < deadline && dm.car.state.ambient.key !== 'cyan') {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.strictEqual(dm.car.state.ambient.key, 'cyan');
+        dm.car.handleSteeringPttSignal(false);
+
+        await dm.stop();
+        await new Promise((r) => ovSrv.close(r));
+        await new Promise((r) => slowWakeGem.close(r));
+    });
+
+    console.log('\nALL ' + passed + ' BMW-VOICE v1.2.0 TEST SUITES PASSED!');
 }
 
 runTests().catch((err) => {

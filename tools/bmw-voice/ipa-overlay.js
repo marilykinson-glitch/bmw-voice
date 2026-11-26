@@ -550,9 +550,9 @@ class IpaOverlay {
 
     _scheduleTopReassertions() {
         while (this.reassertTimers.length) clearTimeout(this.reassertTimers.pop());
-        // Recreate & re-show the Wayland IVI layer across +120ms, +280ms, +560ms, and +950ms so HmiMain3D's
-        // "Không khả dụng" system popup can never bury our BMW IPA overlay regardless of popup timing.
-        [120, 280, 560, 950].forEach((delayMs, idx) => {
+        // Recreate & re-show the Wayland IVI layer across +80ms..+1050ms so HmiMain3D's
+        // "Không khả dụng" system scene change can never bury our BMW IPA overlay regardless of timing.
+        [80, 200, 380, 650, 1050].forEach((delayMs, idx) => {
             const t = setTimeout(() => {
                 if (this.phase === 'hidden' || !this.ready || !this.placed) return;
                 this._write(u32Msg(M.SHOW, [0]));
@@ -643,9 +643,9 @@ class IpaOverlay {
         const H = this.box.h;
         d.reset();
 
-        // Full-area deep BMW iDrive 7 obsidian backdrop (`alpha 0.96`) cleanly masks HmiMain3D's
-        // "Nhập bằng giọng nói không khả dụng" popup while keeping top status strip & left Home rail visible
-        d.clear(packRgba(5, 9, 18, 0.96));
+        // Full-area deep BMW iDrive 7 obsidian backdrop (`alpha 0.99`) cleanly masks HmiMain3D's
+        // "Không khả dụng" scene & red 3D ribbon while keeping top status strip & left Home rail visible
+        d.clear(packRgba(5, 9, 18, 0.99));
 
         const isListen = this.phase === 'listening';
         const isThink = this.phase === 'thinking';

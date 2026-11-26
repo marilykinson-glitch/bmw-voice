@@ -132,29 +132,91 @@ def _extract_pcm_and_ref_db(raw, got, hw_ch, out_channels):
     return bytes(out), ref_db
 
 
-def _fast_chunk_db_and_peak(pcm_bytes, channels=1):
+def _speech_band_db_peak_zcr(pcm_bytes, channels=1):
+    """
+    Measure human speech band (600-5000 Hz) RMS dBFS, peak, and zero-crossing rate.
+    Uses difference filter y[k] = 0.70 * (s[k] - s[k-2]) on 12 kHz decimated PCM:
+      |H(f)| = 1.40 * |sin(pi * f / 6000)|
+      -> Attenuates <150 Hz truck/tire/exhaust rumble by 21..32 dB & notches 6 kHz AC hiss,
+         while passing 1000-4500 Hz human voice ("Hey BMW" & Vietnamese formants) cleanly.
+    """
     samples = array.array("h")
     samples.frombytes(pcm_bytes)
     if sys.byteorder != "little":
         samples.byteswap()
     n = len(samples)
-    if n == 0:
-        return -90.0, 0
-    if channels == 2 and n >= 8:
-        sub_l = samples[0::4]
-        sub_r = samples[1::4]
-        peak_l = max((abs(x) for x in sub_l), default=0)
-        peak_r = max((abs(x) for x in sub_r), default=0)
-        rms_l = math.sqrt(sum(x * x for x in sub_l) / len(sub_l)) / 32768.0 if sub_l else 0.0
-        rms_r = math.sqrt(sum(x * x for x in sub_r) / len(sub_r)) / 32768.0 if sub_r else 0.0
-        rms = max(rms_l, rms_r)
+    if n < 16:
+        return -90.0, 0, 0.0
+
+    def _chan_stats(sub):
+        m = len(sub)
+        if m < 6:
+            return -90.0, 0, 0.0
+        sq_sum = 0.0
+        pk = 0
+        zc = 0
+        prev_y = 0.0
+        cnt = m - 2
+        for k in range(2, m):
+            y = (sub[k] - sub[k - 2]) * 0.70
+            ay = abs(y)
+            if ay > pk:
+                pk = ay
+            sq_sum += y * y
+            if (y >= 0.0 and prev_y < 0.0) or (y < 0.0 and prev_y >= 0.0):
+                zc += 1
+            prev_y = y
+        rms = math.sqrt(sq_sum / float(cnt)) / 32768.0
         db = 20.0 * math.log10(rms) if rms > 1e-5 else -90.0
-        return round(db, 1), int(max(peak_l, peak_r))
-    sub = samples[::4] if n >= 32 else samples
-    peak = max((abs(x) for x in sub), default=0)
-    rms = math.sqrt(sum(x * x for x in sub) / len(sub)) / 32768.0
-    db = 20.0 * math.log10(rms) if rms > 1e-5 else -90.0
-    return round(db, 1), int(peak)
+        return round(db, 1), int(min(32767, round(pk))), round(zc / float(cnt), 3)
+
+    if channels == 2 and n >= 16:
+        # Step by 4 interleaved int16s -> 12 kHz per channel when hw_rate == 24 kHz
+        db_l, pk_l, zcr_l = _chan_stats(samples[0::4])
+        db_r, pk_r, zcr_r = _chan_stats(samples[1::4])
+        if db_l >= db_r:
+            return db_l, max(pk_l, pk_r), zcr_l
+        return db_r, max(pk_l, pk_r), zcr_r
+
+    sub = samples[::2] if n >= 32 else samples
+    return _chan_stats(sub)
+
+
+def _fast_chunk_db_and_peak(pcm_bytes, channels=1):
+    db, pk, _ = _speech_band_db_peak_zcr(pcm_bytes, channels)
+    return db, pk
+
+
+def _highpass_speech_samples(samples, channels):
+    """1st-order ~175 Hz high-pass filter at 16 kHz to strip road/truck sub-bass before auto-gain & STT."""
+    n = len(samples)
+    if n < 4:
+        return samples
+    out = array.array("h", [0] * n)
+    alpha = 0.932
+    if channels == 2:
+        xl = samples[0]
+        xr = samples[1]
+        yl = 0.0
+        yr = 0.0
+        for i in range(0, n - 1, 2):
+            sl = samples[i]
+            sr = samples[i + 1]
+            yl = (sl - xl) + alpha * yl
+            yr = (sr - xr) + alpha * yr
+            xl = sl
+            xr = sr
+            out[i] = max(-32767, min(32767, int(yl)))
+            out[i + 1] = max(-32767, min(32767, int(yr)))
+        return out
+    xp = samples[0]
+    yp = 0.0
+    for i in range(n):
+        s = samples[i]
+        yp = (s - xp) + alpha * yp
+        xp = s
+        out[i] = max(-32767, min(32767, int(yp)))
+    return out
 
 
 def _measure_snr_and_floor(samples, out_channels, out_rate):
@@ -162,12 +224,18 @@ def _measure_snr_and_floor(samples, out_channels, out_rate):
         return 0.0, -90.0
     win = max(240, int(out_rate * 0.06)) * max(1, out_channels)
     dbs = []
-    step = 4 if win >= 480 else 1
+    step = 2 * max(1, out_channels)
     for i in range(0, len(samples), win):
         seg = samples[i : i + win : step]
         if len(seg) < 16:
             continue
-        rms = math.sqrt(sum(x * x for x in seg) / len(seg)) / 32768.0
+        # Evaluate syllabic SNR in the human speech band so <180 Hz truck bumps never fake high SNR
+        sq = 0.0
+        cnt = len(seg) - 1
+        for k in range(1, len(seg)):
+            d = (seg[k] - seg[k - 1]) * 0.72
+            sq += d * d
+        rms = math.sqrt(sq / float(max(1, cnt))) / 32768.0
         dbs.append(20.0 * math.log10(rms) if rms > 1e-5 else -90.0)
     if not dbs:
         return 0.0, -90.0
@@ -218,6 +286,9 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
                 rs.append(samples[src + 1])
             samples = rs
             out_rate = 16000
+
+    samples = _highpass_speech_samples(samples, out_channels)
+    peak = max((abs(x) for x in samples), default=0)
 
     snr_db, floor_db = _measure_snr_and_floor(samples, out_channels, out_rate)
     # Never amplify low-SNR background hiss/hum (`snr_db < 4.8`), which causes LLM speech hallucinations
@@ -492,7 +563,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                 ready_sent = True
                 _emit_json({"event": "ready", "device": device})
 
-            db, pk = _fast_chunk_db_and_peak(chunk_out, out_channels)
+            db, pk, zcr = _speech_band_db_peak_zcr(chunk_out, out_channels)
 
             # 2. Active PTT / 2-step follow-up recording
             if mode == "ptt":
@@ -502,7 +573,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     last_level_emit = now
                     _emit_json({"event": "mic_level", "db": db})
 
-                is_voiced = (db >= max(-47.0, floor_db + 5.8)) and (pk >= 115)
+                is_voiced = (db >= max(-47.0, floor_db + 5.8)) and (pk >= 115) and (0.02 <= zcr <= 0.72)
                 if is_voiced:
                     ptt_voiced += 1
                     ptt_quiet = 0
@@ -530,7 +601,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     ptt_buf.clear()
                     preroll.clear()
                     mode = "wake"
-                    wake_cooldown_until = time.monotonic() + 0.40
+                    wake_cooldown_until = time.monotonic() + 0.60
                 continue
 
             # 3. Background "Hey BMW" Wake Word Listener (`mode == "wake"`)
@@ -550,8 +621,8 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
             # Music reference echo check: only engage speaker bleed floor during real audible playback (`ref_db > -30`)
             music_playing = (hw_ch >= 3) and (ref_db > -30.0)
             expected_bleed = (ref_db + echo_offset_db) if music_playing else -90.0
-            thresh_db = max(-47.5, floor_db + 5.0, expected_bleed + 4.5)
-            is_voiced = (db >= thresh_db) and (pk >= 100)
+            thresh_db = max(-46.5, floor_db + 5.6, expected_bleed + 4.8)
+            is_voiced = (db >= thresh_db) and (pk >= 125) and (0.025 <= zcr <= 0.68)
 
             if not wake_active:
                 if is_voiced:
@@ -578,27 +649,28 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                 if is_voiced:
                     wake_voiced += 1
                     wake_quiet = 0
-                    if not wake_hint_sent and wake_voiced >= 3 and (now - last_hint_at) > 3.0:
+                    if not wake_hint_sent and wake_voiced >= 3 and (now - last_hint_at) > 3.5:
                         wake_hint_sent = True
                         last_hint_at = now
                         _emit_json({"event": "speech_hint"})
                 else:
                     wake_quiet += 1
 
-                # Continuous talk > 6.5s without pause is radio/passenger conversation -> reset quietly
-                if wake_frames > int(hw_rate * 6.5):
+                # Continuous talk/noise > 4.8s without pause is radio/passenger conversation -> reset quietly
+                if wake_frames > int(hw_rate * 4.8):
                     wake_active = False
                     wake_buf.clear()
                     preroll.clear()
+                    wake_cooldown_until = time.monotonic() + 1.5
                     continue
 
                 if wake_quiet >= 8:  # 0.40s end-of-speech pause
-                    # Brisk "Hey BMW" is >= 250ms voiced (5 chunks). Short clicks (<5 chunks) drop locally!
+                    # Brisk "Hey BMW" is >= 250ms voiced (5 chunks). Short clicks & low-SNR road noise drop locally!
                     if wake_voiced >= 5:
                         boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
                             bytes(wake_buf), out_channels, hw_rate
                         )
-                        if snr_db >= 3.5 and f_peak >= 500:
+                        if snr_db >= 4.5 and f_peak >= 600:
                             out_wav = os.path.join(work_dir, "wake_clip.wav")
                             _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
                             dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
@@ -610,6 +682,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                                 "snrDb": snr_db,
                                 "device": device,
                             })
+                            wake_cooldown_until = time.monotonic() + 2.5
                     wake_active = False
                     wake_buf.clear()
     finally:

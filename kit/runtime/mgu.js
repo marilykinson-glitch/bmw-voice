@@ -161,6 +161,7 @@ class Ui {
         this._visHandlers = [];
         this._focus = Object.create(null);    // stateName -> false while a popup covers it
         this._focusHandlers = [];
+        this._rootInFront = null;             // true/false once applicationStackChanged reports ROOT_APP
         this.timing = { png: 0, push: 0 };    // ms spent encoding / handing images to the HMI
         this._cnText = new HmiText();
     }
@@ -209,6 +210,7 @@ class Ui {
     open(stateName) { return this._try('open ' + stateName, this.rhmi.openState(stateName)); }
     close(stateName) { return this._try('close ' + stateName, this.rhmi.closeState(stateName)); }
     isVisible(stateName) { return !!this._visible[stateName]; }
+    isRootInFront() { return this._rootInFront !== false; }
     /** false while an HMI popup covers the (visible) screen */
     hasFocus(stateName) { return this._focus[stateName] !== false; }
     onFocus(fn) { this._focusHandlers.push(fn); }
@@ -730,7 +732,8 @@ async function runInner(impl) {
         if (st && st.on) st.on('focus', (ev) => ui._setFocus(s.name, !(ev && ev.focus === false)));
     });
     ui.rhmi.on('applicationStackChanged', (stack) => {
-        const shown = stack && Object.keys(stack).length > 0 && ('ROOT_APP' in stack);
+        const shown = !!(stack && Object.keys(stack).length > 0 && ('ROOT_APP' in stack));
+        ui._rootInFront = shown;
         Promise.resolve().then(() => (shown ? app.registerHmiVisible() : app.unregisterHmiVisible()))
             .catch((e) => log.warn('hmi visible: ' + e));
         const open = [].concat.apply([], Object.keys(stack || {}).map((k) => stack[k] || []));
@@ -777,7 +780,17 @@ async function runInner(impl) {
             });
         return opening;
     };
-    ctx.openApp = () => (entryUuids[0] ? openEntry(entryUuids[0], 3) : ui.open(mainName));
+    const reclaimEntry = (uuid) => {
+        const map = mapped[uuid] ? Promise.resolve() : ui.rhmi.mapEntryState(uuid, mainState).then(() => { mapped[uuid] = true; });
+        return map
+            .then(() => ui.rhmi.openEntryState(uuid))
+            .then(() => ui.rhmi.openState(mainName).catch(() => {}))
+            .catch((e) => log.warn('reclaim entry state: ' + (e && e.message ? e.message : e)));
+    };
+    ctx.openApp = (opts) => {
+        if (opts && opts.force) return entryUuids[0] ? reclaimEntry(entryUuids[0]) : ui.open(mainName);
+        return entryUuids[0] ? openEntry(entryUuids[0], 3) : ui.open(mainName);
+    };
     ctx.closeApp = () => ui.close(mainName);
     // a tap on the home-screen widget opens the app
     widget.onTap(() => { if (entryUuids[0]) openEntry(entryUuids[0]); });

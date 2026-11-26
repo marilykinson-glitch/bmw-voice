@@ -409,8 +409,83 @@ function parseJsonLoose(raw) {
     return null;
 }
 
-async function decodeWithGemini(opts) {
-    const model = opts.model || 'gemini-3-flash-preview';
+const WAKE_MODEL_CASCADE = [
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-3-flash-preview',
+];
+
+const COMMAND_MODEL_CASCADE = [
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-3-flash-preview',
+    'gemini-2.0-flash-lite',
+];
+
+const modelCooldowns = Object.create(null);
+
+function resetModelCooldowns() {
+    Object.keys(modelCooldowns).forEach((k) => { delete modelCooldowns[k]; });
+}
+
+function markModelCooldown(model, status) {
+    const prev = modelCooldowns[model] || { strikes: 0, until: 0 };
+    const strikes = prev.strikes + 1;
+    let waitMs = 20000;
+    if (status === 404) {
+        waitMs = 3600000;
+    } else if (status === 429) {
+        waitMs = strikes >= 2 ? 180000 : 65000;
+    }
+    modelCooldowns[model] = {
+        strikes,
+        until: Date.now() + waitMs,
+        lastStatus: status,
+    };
+}
+
+function buildModelCandidates(preferredModel, wakeMode) {
+    const base = wakeMode ? WAKE_MODEL_CASCADE : COMMAND_MODEL_CASCADE;
+    const ordered = [];
+    if (!wakeMode && preferredModel && typeof preferredModel === 'string') {
+        ordered.push(preferredModel.trim());
+    }
+    for (let i = 0; i < base.length; i++) {
+        if (ordered.indexOf(base[i]) < 0) ordered.push(base[i]);
+    }
+    if (wakeMode && preferredModel && ordered.indexOf(preferredModel.trim()) < 0) {
+        ordered.push(preferredModel.trim());
+    }
+    const now = Date.now();
+    const ready = [];
+    const cooling = [];
+    for (let j = 0; j < ordered.length; j++) {
+        const m = ordered[j];
+        const cd = modelCooldowns[m];
+        if (cd && cd.until > now) cooling.push(m);
+        else ready.push(m);
+    }
+    // Try non-cooled-down models first; keep earliest-expiring cooled model as final fallback
+    cooling.sort((a, b) => (modelCooldowns[a].until || 0) - (modelCooldowns[b].until || 0));
+    return ready.length ? ready.concat(cooling.slice(0, 1)) : cooling.slice(0, 2);
+}
+
+function formatGeminiErrorVi(err) {
+    const msg = sanitizePlainQuotes((err && err.message) || String(err || '')).slice(0, 72);
+    const status = err && err.httpStatus;
+    if (status === 429 || /\b429\b/.test(msg)) {
+        return 'API Key Gemini chạm giới hạn miễn phí (HTTP 429) - chờ 30 giây hoặc đổi Key trong Cài đặt QR.';
+    }
+    if (status === 400 || status === 401 || status === 403 || /\b(400|401|403)\b/.test(msg)) {
+        return 'Gemini API Key không hợp lệ hoặc hết quyền (' + (status || msg) + ') - kiểm tra trong Cài đặt QR.';
+    }
+    return 'Chưa kết nối mạng tới Gemini (' + msg + '). Kiểm tra Wi-Fi/4G xe.';
+}
+
+async function decodeSingleModelWithGemini(opts, model) {
     const wakeMode = !!opts.wakeMode;
     const userParts = [];
     if (opts.audioWavBase64) {
@@ -452,12 +527,17 @@ async function decodeWithGemini(opts) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
-        timeoutMs: 12000,
+        timeoutMs: 11000,
     });
 
     if (res.status < 200 || res.status >= 300) {
-        throw new Error('Gemini HTTP ' + res.status);
+        const err = new Error('Gemini HTTP ' + res.status);
+        err.httpStatus = res.status;
+        err.model = model;
+        throw err;
     }
+    if (modelCooldowns[model]) delete modelCooldowns[model];
+
     const data = JSON.parse(res.body);
     const cand = data && data.candidates && data.candidates[0];
     const parts = (cand && cand.content && cand.content.parts) || [];
@@ -469,7 +549,29 @@ async function decodeWithGemini(opts) {
     if (!parsed || typeof parsed !== 'object') {
         throw new Error('Phản hồi JSON không hợp lệ');
     }
+    parsed._modelUsed = model;
     return parsed;
+}
+
+async function decodeWithGemini(opts) {
+    const candidates = buildModelCandidates(opts.model || 'gemini-2.5-flash', !!opts.wakeMode);
+    let lastErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+        const model = candidates[i];
+        try {
+            return await decodeSingleModelWithGemini(opts, model);
+        } catch (e) {
+            lastErr = e;
+            const st = e && e.httpStatus;
+            // Fail over immediately across independent model quota buckets on 429, 404, or 5xx
+            if (st === 429 || st === 404 || st === 500 || st === 502 || st === 503) {
+                markModelCooldown(model, st);
+                continue;
+            }
+            break;
+        }
+    }
+    throw lastErr || new Error('Gemini unavailable');
 }
 
 async function processVoiceOrText(opts) {
@@ -569,7 +671,7 @@ async function processVoiceOrText(opts) {
         try {
             const gem = await decodeWithGemini({
                 apiKey: o.apiKey,
-                model: o.model || 'gemini-3-flash-preview',
+                model: o.model || 'gemini-2.5-flash',
                 audioWavBase64: o.audioWavBase64 || '',
                 audioMimeType: o.audioMimeType || 'audio/wav',
                 text: transcript,
@@ -675,6 +777,7 @@ async function processVoiceOrText(opts) {
                     ignored: true,
                     wakeOnly: false,
                     netError: e.message,
+                    httpStatus: (e && e.httpStatus) || 0,
                     engine: 'wake_net_err',
                     speakerZone,
                     transcript: '',
@@ -686,10 +789,11 @@ async function processVoiceOrText(opts) {
                 return {
                     at: Date.now(),
                     ok: false,
+                    httpStatus: (e && e.httpStatus) || 0,
                     engine: 'net_err',
                     speakerZone,
                     transcript: '',
-                    replyVi: 'Chưa kết nối mạng tới Gemini (' + sanitizePlainQuotes(e.message).slice(0, 72) + '). Kiểm tra Wi-Fi/4G xe.',
+                    replyVi: formatGeminiErrorVi(e),
                     actions: [],
                 };
             }
@@ -767,5 +871,8 @@ module.exports = {
     detectPhysicalOnlyUnsupported,
     parseOfflineVietnamese,
     groundToolCallsAgainstTranscript,
+    resetModelCooldowns,
+    buildModelCandidates,
+    formatGeminiErrorVi,
     processVoiceOrText,
 };
