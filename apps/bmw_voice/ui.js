@@ -152,7 +152,8 @@ function draw(cv, G, t, v, act) {
     cv.clear(t.bg);
 
     const state = v.assistantState || 'idle';
-    const hasKey = !!(v.settings && v.settings.hasApiKey);
+    const hasOffline = !!(v.offline && v.offline.stt);
+    const hasKey = !!(v.settings && v.settings.hasApiKey) || hasOffline || !!v.hasVoiceReady;
     const wakeArmed = v.wakeStatus === 'armed';
     const badge = state === 'listening'
         ? { text: 'ĐANG NGHE…', color: 'info' }
@@ -160,9 +161,11 @@ function draw(cv, G, t, v, act) {
             ? { text: 'ĐANG XỬ LÝ…', color: 'info' }
             : (!v.daemonUp
                 ? { text: 'ĐANG KẾT NỐI', color: 'warn' }
-                : (hasKey
-                    ? { text: wakeArmed ? 'HEY BMW · SẴN SÀNG' : 'MIC VÔ-LĂNG · SẴN SÀNG', color: 'ok' }
-                    : { text: 'CHƯA CÀI KEY', color: 'warn' })));
+                : (hasOffline
+                    ? { text: wakeArmed ? 'HEY BMW · OFFLINE' : 'OFFLINE · SẴN SÀNG', color: 'ok' }
+                    : (hasKey
+                        ? { text: wakeArmed ? 'HEY BMW · SẴN SÀNG' : 'MIC VÔ-LĂNG · SẴN SÀNG', color: 'ok' }
+                        : { text: 'CHƯA CÀI KEY', color: 'warn' }))));
 
     G.frame(cv, t, [], -1, [badge]);
 

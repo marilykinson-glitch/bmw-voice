@@ -51,6 +51,337 @@ def _emit_json(obj):
         pass
 
 
+# ============================================================
+# Optional 100% Offline Streaming "Hey BMW" KWS (`sherpa-onnx` C-API v1.12.x)
+# ============================================================
+
+class _SherpaFeatureConfig(ctypes.Structure):
+    _fields_ = [
+        ("sample_rate", ctypes.c_int32),
+        ("feature_dim", ctypes.c_int32),
+    ]
+
+
+class _SherpaOnlineTransducerModelConfig(ctypes.Structure):
+    _fields_ = [
+        ("encoder", ctypes.c_char_p),
+        ("decoder", ctypes.c_char_p),
+        ("joiner", ctypes.c_char_p),
+    ]
+
+
+class _SherpaOnlineParaformerModelConfig(ctypes.Structure):
+    _fields_ = [
+        ("encoder", ctypes.c_char_p),
+        ("decoder", ctypes.c_char_p),
+    ]
+
+
+class _SherpaOnlineZipformer2CtcModelConfig(ctypes.Structure):
+    _fields_ = [("model", ctypes.c_char_p)]
+
+
+class _SherpaOnlineNemoCtcModelConfig(ctypes.Structure):
+    _fields_ = [("model", ctypes.c_char_p)]
+
+
+class _SherpaOnlineToneCtcModelConfig(ctypes.Structure):
+    _fields_ = [("model", ctypes.c_char_p)]
+
+
+class _SherpaOnlineModelConfig(ctypes.Structure):
+    _fields_ = [
+        ("transducer", _SherpaOnlineTransducerModelConfig),
+        ("paraformer", _SherpaOnlineParaformerModelConfig),
+        ("zipformer2_ctc", _SherpaOnlineZipformer2CtcModelConfig),
+        ("tokens", ctypes.c_char_p),
+        ("num_threads", ctypes.c_int32),
+        ("provider", ctypes.c_char_p),
+        ("debug", ctypes.c_int32),
+        ("model_type", ctypes.c_char_p),
+        ("modeling_unit", ctypes.c_char_p),
+        ("bpe_vocab", ctypes.c_char_p),
+        ("tokens_buf", ctypes.c_char_p),
+        ("tokens_buf_size", ctypes.c_int32),
+        ("nemo_ctc", _SherpaOnlineNemoCtcModelConfig),
+        ("t_one_ctc", _SherpaOnlineToneCtcModelConfig),
+    ]
+
+
+class _SherpaKeywordSpotterConfig(ctypes.Structure):
+    _fields_ = [
+        ("feat_config", _SherpaFeatureConfig),
+        ("model_config", _SherpaOnlineModelConfig),
+        ("max_active_paths", ctypes.c_int32),
+        ("num_trailing_blanks", ctypes.c_int32),
+        ("keywords_score", ctypes.c_float),
+        ("keywords_threshold", ctypes.c_float),
+        ("keywords_file", ctypes.c_char_p),
+        ("keywords_buf", ctypes.c_char_p),
+        ("keywords_buf_size", ctypes.c_int32),
+    ]
+
+
+class LocalKwsEngine:
+    """Zero-network streaming 'Hey BMW' keyword spotter powered by libsherpa-onnx-c-api.so."""
+
+    @staticmethod
+    def _pick_onnx(kws_dir, prefix, prefer_int8=True):
+        if not os.path.isdir(kws_dir):
+            return ""
+        cands = [f for f in os.listdir(kws_dir) if f.startswith(prefix) and f.endswith(".onnx")]
+        if not cands:
+            return ""
+        cands.sort(key=lambda n: (0 if (".int8." in n) == prefer_int8 else 1, len(n), n))
+        return os.path.join(kws_dir, cands[0])
+
+    def __init__(self, offline_dir):
+        self.lib = None
+        self.spotter = None
+        self.stream = None
+        self.available = False
+        self.error = ""
+        self._keepalive = []
+        self._ds_carry = None
+        self._hp_xp = 0.0
+        self._hp_yp = 0.0
+        self._agc_gain = 1.0
+
+        if not offline_dir:
+            return
+        lib_dir = os.path.join(offline_dir, "lib")
+        kws_dir = os.path.join(offline_dir, "kws")
+        ort_so = os.path.join(lib_dir, "libonnxruntime.so")
+        capi_so = os.path.join(lib_dir, "libsherpa-onnx-c-api.so")
+        enc = self._pick_onnx(kws_dir, "encoder", prefer_int8=True)
+        dec = self._pick_onnx(kws_dir, "decoder", prefer_int8=False)
+        joi = self._pick_onnx(kws_dir, "joiner", prefer_int8=True)
+        tok = os.path.join(kws_dir, "tokens.txt")
+        kwf = os.path.join(kws_dir, "keywords.txt")
+
+        for p in (ort_so, capi_so, enc, dec, joi, tok, kwf):
+            if not p or not os.path.exists(p):
+                return
+
+        try:
+            ctypes.CDLL(ort_so, mode=ctypes.RTLD_GLOBAL)
+            lib = ctypes.CDLL(capi_so)
+
+            lib.SherpaOnnxCreateKeywordSpotter.argtypes = [ctypes.POINTER(_SherpaKeywordSpotterConfig)]
+            lib.SherpaOnnxCreateKeywordSpotter.restype = ctypes.c_void_p
+            lib.SherpaOnnxDestroyKeywordSpotter.argtypes = [ctypes.c_void_p]
+            lib.SherpaOnnxDestroyKeywordSpotter.restype = None
+
+            lib.SherpaOnnxCreateKeywordStream.argtypes = [ctypes.c_void_p]
+            lib.SherpaOnnxCreateKeywordStream.restype = ctypes.c_void_p
+            lib.SherpaOnnxDestroyOnlineStream.argtypes = [ctypes.c_void_p]
+            lib.SherpaOnnxDestroyOnlineStream.restype = None
+
+            lib.SherpaOnnxOnlineStreamAcceptWaveform.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int32,
+            ]
+            lib.SherpaOnnxOnlineStreamAcceptWaveform.restype = None
+
+            lib.SherpaOnnxIsKeywordStreamReady.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.SherpaOnnxIsKeywordStreamReady.restype = ctypes.c_int32
+            lib.SherpaOnnxDecodeKeywordStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.SherpaOnnxDecodeKeywordStream.restype = None
+            lib.SherpaOnnxResetKeywordStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.SherpaOnnxResetKeywordStream.restype = None
+
+            lib.SherpaOnnxGetKeywordResultAsJson.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.SherpaOnnxGetKeywordResultAsJson.restype = ctypes.c_void_p
+            lib.SherpaOnnxFreeKeywordResultJson.argtypes = [ctypes.c_void_p]
+            lib.SherpaOnnxFreeKeywordResultJson.restype = None
+
+            cfg = _SherpaKeywordSpotterConfig()
+            cfg.feat_config.sample_rate = 16000
+            cfg.feat_config.feature_dim = 80
+            b_enc = enc.encode("utf-8")
+            b_dec = dec.encode("utf-8")
+            b_joi = joi.encode("utf-8")
+            b_tok = tok.encode("utf-8")
+            b_kwf = kwf.encode("utf-8")
+            b_prov = b"cpu"
+            self._keepalive = [b_enc, b_dec, b_joi, b_tok, b_kwf, b_prov]
+
+            cfg.model_config.transducer.encoder = b_enc
+            cfg.model_config.transducer.decoder = b_dec
+            cfg.model_config.transducer.joiner = b_joi
+            cfg.model_config.tokens = b_tok
+            cfg.model_config.num_threads = 1
+            cfg.model_config.provider = b_prov
+            cfg.model_config.debug = 0
+
+            cfg.max_active_paths = 6
+            cfg.num_trailing_blanks = 1
+            cfg.keywords_score = 3.0
+            cfg.keywords_threshold = 0.05
+            cfg.keywords_file = b_kwf
+
+            spotter = lib.SherpaOnnxCreateKeywordSpotter(ctypes.byref(cfg))
+            if not spotter:
+                self.error = "SherpaOnnxCreateKeywordSpotter returned NULL"
+                return
+            stream = lib.SherpaOnnxCreateKeywordStream(spotter)
+            if not stream:
+                lib.SherpaOnnxDestroyKeywordSpotter(spotter)
+                self.error = "SherpaOnnxCreateKeywordStream returned NULL"
+                return
+
+            self.lib = lib
+            self.spotter = spotter
+            self.stream = stream
+            self.available = True
+        except Exception as exc:
+            self.error = str(exc)
+            self.close()
+
+    def reset(self):
+        self._hp_xp = 0.0
+        self._hp_yp = 0.0
+        self._agc_gain = 1.0
+        if self.available and self.lib and self.spotter and self.stream:
+            try:
+                self.lib.SherpaOnnxResetKeywordStream(self.spotter, self.stream)
+            except Exception:
+                pass
+
+    def feed_pcm_int16(self, pcm_bytes, out_channels, sample_rate):
+        """Feed raw s16le PCM (mono or stereo) into sherpa-onnx KWS at 16 kHz. Returns detected keyword or ''."""
+        if not self.available or not pcm_bytes:
+            return ""
+        samples = array.array("h")
+        samples.frombytes(pcm_bytes)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        if not samples:
+            return ""
+
+        if out_channels >= 2:
+            left = samples[0::2]
+            right = samples[1::2]
+            n_frames = len(left)
+            if n_frames <= 0:
+                return ""
+            step = 4 if n_frames > 120 else 1
+            sq_l = 0.0
+            sq_r = 0.0
+            for i in range(0, n_frames, step):
+                sq_l += left[i] * left[i]
+                sq_r += right[i] * right[i]
+            if sq_l >= sq_r * 1.82:
+                mono = left
+            elif sq_r >= sq_l * 1.82:
+                mono = right
+            else:
+                mono = array.array("h", ((left[i] + right[i]) >> 1 for i in range(n_frames)))
+        else:
+            mono = samples
+
+        sr = int(sample_rate)
+        # 1st-order ~175 Hz high-pass filter + smooth AGC boost (car cabin -34 dBFS -> ~-16 dBFS)
+        alpha = 0.954 if sr >= 22000 else 0.932
+        xp = self._hp_xp
+        yp = self._hp_yp
+        hp = []
+        sq_hp = 0.0
+        for x in mono:
+            fx = float(x)
+            yp = (fx - xp) + alpha * yp
+            xp = fx
+            hp.append(yp)
+            sq_hp += yp * yp
+        self._hp_xp = xp
+        self._hp_yp = yp
+
+        rms = math.sqrt(sq_hp / float(max(1, len(hp))))
+        if rms >= 160.0:
+            tgt_gain = min(6.5, max(1.0, 4800.0 / rms))
+            self._agc_gain = self._agc_gain * 0.65 + tgt_gain * 0.35
+        g = self._agc_gain
+        inv = g / 32768.0
+
+        if sr == 24000 and len(hp) >= 3:
+            # Clean 3:2 linear downsample to 16 kHz in float domain
+            n_triples = len(hp) // 3
+            ds = []
+            for i in range(n_triples):
+                b = i * 3
+                v0 = hp[b] * inv
+                v1 = ((hp[b + 1] + hp[b + 2]) * 0.5) * inv
+                if v0 > 0.98:
+                    v0 = 0.98
+                elif v0 < -0.98:
+                    v0 = -0.98
+                if v1 > 0.98:
+                    v1 = 0.98
+                elif v1 < -0.98:
+                    v1 = -0.98
+                ds.append(v0)
+                ds.append(v1)
+            if not ds:
+                return ""
+            fbuf = (ctypes.c_float * len(ds))(*ds)
+            n_in = len(ds)
+            sr = 16000
+        else:
+            n_in = len(hp)
+            ds = []
+            for v in hp:
+                fv = v * inv
+                if fv > 0.98:
+                    fv = 0.98
+                elif fv < -0.98:
+                    fv = -0.98
+                ds.append(fv)
+            fbuf = (ctypes.c_float * n_in)(*ds)
+
+        self.lib.SherpaOnnxOnlineStreamAcceptWaveform(self.stream, sr, fbuf, int(n_in))
+        while self.lib.SherpaOnnxIsKeywordStreamReady(self.spotter, self.stream):
+            self.lib.SherpaOnnxDecodeKeywordStream(self.spotter, self.stream)
+
+        ptr = self.lib.SherpaOnnxGetKeywordResultAsJson(self.spotter, self.stream)
+        if not ptr:
+            return ""
+        try:
+            raw_json = ctypes.string_at(ptr).decode("utf-8", "replace")
+        finally:
+            self.lib.SherpaOnnxFreeKeywordResultJson(ptr)
+
+        if not raw_json:
+            return ""
+        try:
+            data = json.loads(raw_json)
+            kw = str(data.get("keyword") or "").strip()
+            if kw:
+                self.lib.SherpaOnnxResetKeywordStream(self.spotter, self.stream)
+                return kw
+        except Exception:
+            pass
+        return ""
+
+    def close(self):
+        if self.lib:
+            try:
+                if self.stream:
+                    self.lib.SherpaOnnxDestroyOnlineStream(self.stream)
+            except Exception:
+                pass
+            try:
+                if self.spotter:
+                    self.lib.SherpaOnnxDestroyKeywordSpotter(self.spotter)
+            except Exception:
+                pass
+        self.stream = None
+        self.spotter = None
+        self.lib = None
+        self.available = False
+
+
 def _load_asound():
     asound = ctypes.CDLL("libasound.so.2")
     asound.snd_strerror.argtypes = [ctypes.c_int]
@@ -272,18 +603,35 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
         peak = max((abs(x) for x in samples), default=0)
 
     if out_rate == 24000 and len(samples) >= 12:
+        # Clean linear-interpolated 3:2 downsampling (24 kHz -> 16 kHz) to avoid nearest-neighbor
+        # jitter/aliasing that distorts Vietnamese vowel formants and tones.
         if out_channels == 1:
-            out_len = (len(samples) * 2) // 3
-            samples = array.array("h", (samples[(i * 3) // 2] for i in range(out_len)))
+            n_in = len(samples)
+            out_len = (n_in * 2) // 3
+            rs = array.array("h", [0] * out_len)
+            for i in range(out_len):
+                if (i & 1) == 0:
+                    rs[i] = samples[(i // 2) * 3]
+                else:
+                    base = (i // 2) * 3 + 1
+                    nxt = base + 1 if (base + 1) < n_in else base
+                    rs[i] = (samples[base] + samples[nxt]) >> 1
+            samples = rs
             out_rate = 16000
         elif out_channels == 2:
             in_f = len(samples) // 2
             out_f = (in_f * 2) // 3
-            rs = array.array("h")
+            rs = array.array("h", [0] * (out_f * 2))
             for i in range(out_f):
-                src = ((i * 3) // 2) * 2
-                rs.append(samples[src])
-                rs.append(samples[src + 1])
+                if (i & 1) == 0:
+                    s0 = ((i // 2) * 3) * 2
+                    rs[i * 2] = samples[s0]
+                    rs[i * 2 + 1] = samples[s0 + 1]
+                else:
+                    f1 = (i // 2) * 3 + 1
+                    f2 = f1 + 1 if (f1 + 1) < in_f else f1
+                    rs[i * 2] = (samples[f1 * 2] + samples[f2 * 2]) >> 1
+                    rs[i * 2 + 1] = (samples[f1 * 2 + 1] + samples[f2 * 2 + 1]) >> 1
             samples = rs
             out_rate = 16000
 
@@ -291,8 +639,8 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
     peak = max((abs(x) for x in samples), default=0)
 
     snr_db, floor_db = _measure_snr_and_floor(samples, out_channels, out_rate)
-    # Never amplify low-SNR background hiss/hum (`snr_db < 4.8`), which causes LLM speech hallucinations
-    if 90 <= peak < 18000 and snr_db >= 4.8:
+    # Boost quiet driver speech even in noisy AC/road cabin (`snr_db >= 3.2`), while avoiding boosting pure hiss
+    if 80 <= peak < 18000 and snr_db >= 3.2:
         gain = min(12.0, 21000.0 / float(peak))
         if floor_db > -80.0:
             max_noise_gain = 10.0 ** ((-34.0 - floor_db) / 20.0)
@@ -425,7 +773,29 @@ def record_smartx_wav(device, out_wav, duration_sec=4.2, rate=24000, hw_channels
         asound.snd_pcm_close(pcm)
 
 
-def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
+def _stereo_lr_db(pcm_bytes, out_channels):
+    """Estimate Left (driver) and Right (passenger) RMS dBFS from short PCM buffer."""
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if len(samples) < 8:
+        return -60.0, -60.0
+    if out_channels >= 2:
+        left = samples[0::4]
+        right = samples[1::4]
+        rms_l = math.sqrt(sum(x * x for x in left) / float(max(1, len(left)))) / 32768.0
+        rms_r = math.sqrt(sum(x * x for x in right) / float(max(1, len(right)))) / 32768.0
+        db_l = round(20.0 * math.log10(rms_l), 1) if rms_l > 1e-5 else -65.0
+        db_r = round(20.0 * math.log10(rms_r), 1) if rms_r > 1e-5 else -65.0
+        return db_l, db_r
+    sub = samples[::2]
+    rms = math.sqrt(sum(x * x for x in sub) / float(max(1, len(sub)))) / 32768.0
+    db = round(20.0 * math.log10(rms), 1) if rms > 1e-5 else -65.0
+    return db, db
+
+
+def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8, offline_dir=""):
     global STOP_FLAG
     try:
         os.nice(8)
@@ -455,6 +825,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
     reader = threading.Thread(target=_stdin_reader, daemon=True)
     reader.start()
 
+    kws = LocalKwsEngine(offline_dir or os.environ.get("BV_OFFLINE_DIR", ""))
     asound = _load_asound()
     hw_rate = int(rate)
     hw_ch = max(1, int(hw_channels))
@@ -476,14 +847,18 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
         floor_db = -46.0
         echo_offset_db = -8.0  # typical ceiling mic attenuation vs speaker reference
         calib_count = 0
+        speaker_playing = False
+        speaker_active_until = 0.0
+        has_ref_channel = hw_ch >= 3
 
         # Mode: "wake" | "ptt"
         mode = "wake"
         ptt_buf = bytearray()
         ptt_frames = 0
-        ptt_max_frames = int(hw_rate * 4.2)
+        ptt_max_frames = int(hw_rate * 5.0)
         ptt_voiced = 0
-        ptt_quiet = 0
+        ptt_voiced_frames = 0
+        ptt_quiet_frames = 0
         ptt_req_id = 0
         last_level_emit = 0.0
 
@@ -491,10 +866,13 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
         wake_buf = bytearray()
         wake_frames = 0
         wake_voiced = 0
-        wake_quiet = 0
+        wake_voiced_frames = 0
+        wake_quiet_frames = 0
         wake_hint_sent = False
         last_hint_at = 0.0
         wake_cooldown_until = 0.0
+        kws_hangover_until = 0.0
+        kws_active = False
 
         while not STOP_FLAG:
             # 1. Process instant commands from Node (<1ms PTT switch!)
@@ -508,16 +886,18 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     mode = "ptt"
                     wake_active = False
                     wake_buf.clear()
+                    kws.reset()
                     ptt_buf = bytearray()
                     if not c.get("noPreroll"):
                         recent = list(preroll)[-4:]  # 200ms pre-roll so 1st syllable is crisp
                         for ch_bytes in recent:
                             ptt_buf.extend(ch_bytes)
                     ptt_frames = 0
-                    max_sec = max(1.8, min(6.5, float(c.get("maxSec", 4.2))))
+                    max_sec = max(1.8, min(6.5, float(c.get("maxSec", 5.0))))
                     ptt_max_frames = int(hw_rate * max_sec)
                     ptt_voiced = 0
-                    ptt_quiet = 0
+                    ptt_voiced_frames = 0
+                    ptt_quiet_frames = 0
                     ptt_req_id = int(c.get("reqId", 0))
                     _emit_json({"event": "ptt_started", "reqId": ptt_req_id})
                 elif cname == "ptt_stop" and mode == "ptt":
@@ -527,6 +907,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     wake_cooldown_until = time.monotonic() + (ms / 1000.0)
                     wake_active = False
                     wake_buf.clear()
+                    kws.reset()
 
             if STOP_FLAG:
                 break
@@ -561,7 +942,25 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
 
             if not ready_sent:
                 ready_sent = True
-                _emit_json({"event": "ready", "device": device})
+                _emit_json({
+                    "event": "ready",
+                    "device": device,
+                    "kwsMode": "offline" if kws.available else "cloud_vad",
+                    "kwsError": kws.error,
+                    "hasRefChannel": has_ref_channel,
+                })
+
+            if has_ref_channel:
+                if ref_db > -38.0:
+                    speaker_active_until = now + 0.90
+                next_spk = now < speaker_active_until
+                if next_spk != speaker_playing:
+                    speaker_playing = next_spk
+                    _emit_json({
+                        "event": "speaker_state",
+                        "playing": speaker_playing,
+                        "refDb": ref_db,
+                    })
 
             db, pk, zcr = _speech_band_db_peak_zcr(chunk_out, out_channels)
 
@@ -573,14 +972,20 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     last_level_emit = now
                     _emit_json({"event": "mic_level", "db": db})
 
-                is_voiced = (db >= max(-47.0, floor_db + 5.8)) and (pk >= 115) and (0.02 <= zcr <= 0.72)
+                is_voiced = (db >= max(-48.0, floor_db + 4.8)) and (pk >= 100) and (0.015 <= zcr <= 0.75)
                 if is_voiced:
                     ptt_voiced += 1
-                    ptt_quiet = 0
-                elif ptt_voiced >= 5:
-                    ptt_quiet += 1
+                    ptt_voiced_frames += got
+                    ptt_quiet_frames = 0
+                elif ptt_voiced_frames >= int(hw_rate * 0.28):
+                    ptt_quiet_frames += got
 
-                done_early = ptt_voiced >= 5 and ptt_quiet >= 10 and ptt_frames >= int(hw_rate * 0.75)
+                # Frame-accurate timing (SmartXbar reads ~22ms per call): wait >=1.40s total & 0.80s pause
+                done_early = (
+                    ptt_voiced_frames >= int(hw_rate * 0.28)
+                    and ptt_quiet_frames >= int(hw_rate * 0.80)
+                    and ptt_frames >= int(hw_rate * 1.40)
+                )
                 if done_early or ptt_frames >= ptt_max_frames:
                     out_wav = os.path.join(work_dir, "ptt_clip.wav")
                     boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
@@ -600,6 +1005,7 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     })
                     ptt_buf.clear()
                     preroll.clear()
+                    kws.reset()
                     mode = "wake"
                     wake_cooldown_until = time.monotonic() + 0.60
                 continue
@@ -618,11 +1024,124 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                     calib_count += 1
                 continue
 
+            # 3A. Hybrid "Hey BMW" Wake: Fast Offline Streaming KWS (<50ms) + Short-Utterance VAD Fallback (`wake_clip`)
+            if kws.available:
+                music_playing = (hw_ch >= 3) and (ref_db > -30.0)
+                expected_bleed = (ref_db + echo_offset_db) if music_playing else -90.0
+                # Soft speech gate (3.2 dB above floor) wakes KWS with 500ms preroll; skips silence to save CPU
+                kws_thresh = max(-54.0, floor_db + 3.2, expected_bleed + 2.0)
+                has_speech = (db >= kws_thresh) and (pk >= 80) and (0.015 <= zcr <= 0.78)
+                if has_speech:
+                    if not kws_active:
+                        kws_active = True
+                        wake_active = True
+                        wake_buf = bytearray()
+                        for ch_bytes in list(preroll)[-10:]:
+                            wake_buf.extend(ch_bytes)
+                        wake_frames = got
+                        wake_voiced = 1
+                        wake_voiced_frames = got
+                        wake_quiet_frames = 0
+                        # Feed recent ~500ms preroll chunks so first syllable "Hey" is never lost
+                        for pre_ch in list(preroll)[-11:-1]:
+                            kw_pre = kws.feed_pcm_int16(pre_ch, out_channels, hw_rate)
+                            if kw_pre:
+                                recent_pcm = b"".join(list(preroll)[-10:])
+                                ldb, rdb = _stereo_lr_db(recent_pcm, out_channels)
+                                wake_cooldown_until = time.monotonic() + 1.80
+                                kws_active = False
+                                kws_hangover_until = 0.0
+                                wake_active = False
+                                wake_buf.clear()
+                                kws.reset()
+                                _emit_json({
+                                    "event": "local_wake",
+                                    "keyword": kw_pre,
+                                    "leftDb": ldb,
+                                    "rightDb": rdb,
+                                    "device": device,
+                                })
+                                break
+                    else:
+                        if wake_active:
+                            wake_buf.extend(chunk_out)
+                            wake_frames += got
+                            wake_voiced += 1
+                            wake_voiced_frames += got
+                            wake_quiet_frames = 0
+                    kws_hangover_until = now + 1.80
+                else:
+                    if wake_active:
+                        wake_buf.extend(chunk_out)
+                        wake_frames += got
+                        wake_quiet_frames += got
+                    if db > -85.0:
+                        if db < floor_db:
+                            floor_db = max(-62.0, min(-22.0, floor_db * 0.70 + db * 0.30))
+                        else:
+                            floor_db = max(-62.0, min(-22.0, floor_db * 0.96 + db * 0.04))
+                    if music_playing and db > -75.0:
+                        echo_offset_db = max(-22.0, min(6.0, echo_offset_db * 0.95 + (db - ref_db) * 0.05))
+
+                if kws_active and now < wake_cooldown_until:
+                    continue
+                if kws_active:
+                    if now <= kws_hangover_until:
+                        kw = kws.feed_pcm_int16(chunk_out, out_channels, hw_rate)
+                        if kw:
+                            recent_pcm = b"".join(list(preroll)[-10:])
+                            ldb, rdb = _stereo_lr_db(recent_pcm, out_channels)
+                            wake_cooldown_until = time.monotonic() + 1.80
+                            kws_active = False
+                            kws_hangover_until = 0.0
+                            wake_active = False
+                            wake_buf.clear()
+                            kws.reset()
+                            _emit_json({
+                                "event": "local_wake",
+                                "keyword": kw,
+                                "leftDb": ldb,
+                                "rightDb": rdb,
+                                "device": device,
+                            })
+                            continue
+                    else:
+                        kws_active = False
+                        kws.reset()
+
+                # Fallback if KWS missed accented "Hey BMW": check short clear utterance once on pause!
+                if wake_active:
+                    if wake_frames > int(hw_rate * 2.8):
+                        wake_active = False
+                        wake_buf.clear()
+                    elif wake_quiet_frames >= int(hw_rate * 0.42):
+                        if int(hw_rate * 0.25) <= wake_voiced_frames <= int(hw_rate * 1.90):
+                            boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
+                                bytes(wake_buf), out_channels, hw_rate
+                            )
+                            if snr_db >= 2.8 and f_peak >= 320:
+                                out_wav = os.path.join(work_dir, "wake_clip.wav")
+                                _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
+                                dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
+                                _emit_json({
+                                    "event": "wake_clip",
+                                    "file": out_wav,
+                                    "durationMs": dur_ms,
+                                    "peak": f_peak,
+                                    "snrDb": snr_db,
+                                    "device": device,
+                                })
+                                wake_cooldown_until = time.monotonic() + 1.20
+                        wake_active = False
+                        wake_buf.clear()
+                continue
+
+            # 3B. Fallback Cloud VAD "Hey BMW" Clipper (used only when offline KWS bundle is absent)
             # Music reference echo check: only engage speaker bleed floor during real audible playback (`ref_db > -30`)
             music_playing = (hw_ch >= 3) and (ref_db > -30.0)
             expected_bleed = (ref_db + echo_offset_db) if music_playing else -90.0
-            thresh_db = max(-46.5, floor_db + 5.6, expected_bleed + 4.8)
-            is_voiced = (db >= thresh_db) and (pk >= 125) and (0.025 <= zcr <= 0.68)
+            thresh_db = max(-48.0, floor_db + 4.8, expected_bleed + 3.0)
+            is_voiced = (db >= thresh_db) and (pk >= 110) and (0.018 <= zcr <= 0.74)
 
             if not wake_active:
                 if is_voiced:
@@ -632,7 +1151,8 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                         wake_buf.extend(ch_bytes)
                     wake_frames = got
                     wake_voiced = 1
-                    wake_quiet = 0
+                    wake_voiced_frames = got
+                    wake_quiet_frames = 0
                     wake_hint_sent = False
                 else:
                     if db > -85.0:
@@ -648,29 +1168,33 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                 wake_frames += got
                 if is_voiced:
                     wake_voiced += 1
-                    wake_quiet = 0
-                    if not wake_hint_sent and wake_voiced >= 3 and (now - last_hint_at) > 3.5:
+                    wake_voiced_frames += got
+                    wake_quiet_frames = 0
+                    if not wake_hint_sent and wake_voiced_frames >= int(hw_rate * 0.14) and (now - last_hint_at) > 3.5:
                         wake_hint_sent = True
                         last_hint_at = now
                         _emit_json({"event": "speech_hint"})
                 else:
-                    wake_quiet += 1
+                    wake_quiet_frames += got
 
-                # Continuous talk/noise > 4.8s without pause is radio/passenger conversation -> reset quietly
-                if wake_frames > int(hw_rate * 4.8):
+                # Continuous talk/noise > 5.2s without pause is radio/passenger conversation -> reset quietly
+                if wake_frames > int(hw_rate * 5.2):
                     wake_active = False
                     wake_buf.clear()
                     preroll.clear()
-                    wake_cooldown_until = time.monotonic() + 1.5
+                    wake_cooldown_until = time.monotonic() + 1.2
                     continue
 
-                if wake_quiet >= 8:  # 0.40s end-of-speech pause
-                    # Brisk "Hey BMW" is >= 250ms voiced (5 chunks). Short clicks & low-SNR road noise drop locally!
-                    if wake_voiced >= 5:
+                # Adaptive end-of-speech pause: snappy 0.32s for short "Hey BMW" wake (~0.5-1.1s voiced),
+                # 0.50s for longer 1-shot commands ("Hey BMW điều hòa 22 độ").
+                quiet_target_frames = int(hw_rate * (0.32 if wake_voiced_frames <= int(hw_rate * 1.15) else 0.50))
+                if wake_quiet_frames >= quiet_target_frames:
+                    # Brisk "Hey BMW" is >= 220ms voiced. Short clicks & low-SNR road hum drop locally!
+                    if wake_voiced_frames >= int(hw_rate * 0.22):
                         boosted, f_ch, f_rate, f_peak, snr_db = _condition_and_boost_pcm(
                             bytes(wake_buf), out_channels, hw_rate
                         )
-                        if snr_db >= 4.5 and f_peak >= 600:
+                        if snr_db >= 2.6 and f_peak >= 320:
                             out_wav = os.path.join(work_dir, "wake_clip.wav")
                             _write_wav_atomic(out_wav, f_ch, f_rate, boosted)
                             dur_ms = int(round((len(boosted) / float(max(1, f_ch * 2 * f_rate))) * 1000))
@@ -682,10 +1206,11 @@ def run_stream_daemon(device, work_dir, rate=24000, hw_channels=8):
                                 "snrDb": snr_db,
                                 "device": device,
                             })
-                            wake_cooldown_until = time.monotonic() + 2.5
+                            wake_cooldown_until = time.monotonic() + 1.2
                     wake_active = False
                     wake_buf.clear()
     finally:
+        kws.close()
         asound.snd_pcm_close(pcm)
 
 
@@ -695,8 +1220,9 @@ def main():
         wdir = sys.argv[3]
         rt = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
         ch = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+        odir = sys.argv[6] if len(sys.argv) > 6 else ""
         try:
-            run_stream_daemon(dev, wdir, rt, ch)
+            run_stream_daemon(dev, wdir, rt, ch, odir)
         except Exception as exc:
             _emit_json({"event": "error", "error": str(exc)})
             sys.exit(2)

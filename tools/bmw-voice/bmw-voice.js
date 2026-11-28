@@ -28,9 +28,10 @@ const Up = require('./uplink');
 const CarControl = require('./car-control');
 const MicCapture = require('./mic-capture');
 const NluBrain = require('./nlu-brain');
+const OfflineAi = require('./offline-ai');
 const { IpaOverlay } = require('./ipa-overlay');
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const FW_TAG = 'bmw-voice';
 const APP_RE = /^bmw_voice\d*$/;
 
@@ -42,6 +43,7 @@ function createDaemonConfig(over) {
         state: env('BV_STATE', '/var/opt/bmw-voice'),
         oap: env('BV_OAP', '/var/opt/public/oap'),
         proc: env('BV_PROC', '/proc'),
+        offlineDir: env('BV_OFFLINE_DIR', OfflineAi.DEFAULT_OFFLINE_DIR),
         port: Number(env('BV_PORT', 8145)),
         host: env('BV_HOST', '0.0.0.0'),
         nft: env('BV_NFT', 'nft'),
@@ -74,9 +76,10 @@ function writeAtomic(file, data, mode) {
 function defaultSettings() {
     return {
         apiKey: '',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.5-flash-lite',
         pttTrigger: 'short_press', // short_press | long_press | double_press | disabled
         handsFreeWake: true,       // "Hey BMW" hands-free wake word enabled by default
+        voiceReply: true,          // Speak Vietnamese confirmation over BMW OapGenericOverlay (ducks music)
         swapMicChannels: false,
     };
 }
@@ -84,7 +87,8 @@ function defaultSettings() {
 function normalizeModelName(raw, fallback) {
     const m = typeof raw === 'string' ? raw.trim() : '';
     if (!m) return fallback;
-    if (/^gemini-1\.5-/i.test(m) || /^gemini-3-flash-preview$/i.test(m)) return 'gemini-2.5-flash';
+    // Legacy Gemini 1.5 / 2.0 / 2.5 and 3-flash-preview models return HTTP 404 or 429 on new keys
+    if (/^gemini-(?:1\.5|2\.0|2\.5)-/i.test(m) || /^gemini-3-flash-preview$/i.test(m)) return 'gemini-3.5-flash-lite';
     return m;
 }
 
@@ -97,8 +101,40 @@ function normalizeSettings(raw) {
         model: normalizeModelName(r.model, d.model),
         pttTrigger: (ptt === 'short_press' || ptt === 'long_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,
         handsFreeWake: r.handsFreeWake !== undefined ? !!r.handsFreeWake : d.handsFreeWake,
+        voiceReply: r.voiceReply !== undefined ? !!r.voiceReply : d.voiceReply,
         swapMicChannels: !!r.swapMicChannels,
     };
+}
+
+function buildWakeChimeWav() {
+    // Pleasant 220ms two-tone OEM BMW ascending chime (D5 -> A5, 24 kHz 16-bit mono PCM)
+    const sr = 24000;
+    const total = Math.round(sr * 0.22);
+    const pcm = Buffer.alloc(total * 2);
+    for (let i = 0; i < total; i++) {
+        const t = i / sr;
+        const f = t < 0.10 ? 587.33 : 880.0;
+        const localT = t < 0.10 ? t : (t - 0.10);
+        const dur = t < 0.10 ? 0.10 : 0.12;
+        const env = Math.sin(Math.PI * Math.min(1, localT / dur));
+        const s = Math.sin(2 * Math.PI * f * t) * 0.28 * env;
+        pcm.writeInt16LE(Math.max(-32767, Math.min(32767, Math.round(s * 32767))), i * 2);
+    }
+    const hdr = Buffer.alloc(44);
+    hdr.write('RIFF', 0);
+    hdr.writeUInt32LE(36 + pcm.length, 4);
+    hdr.write('WAVE', 8);
+    hdr.write('fmt ', 12);
+    hdr.writeUInt32LE(16, 16);
+    hdr.writeUInt16LE(1, 20);
+    hdr.writeUInt16LE(1, 22);
+    hdr.writeUInt32LE(sr, 24);
+    hdr.writeUInt32LE(sr * 2, 28);
+    hdr.writeUInt16LE(2, 32);
+    hdr.writeUInt16LE(16, 34);
+    hdr.write('data', 36);
+    hdr.writeUInt32LE(pcm.length, 40);
+    return Buffer.concat([hdr, pcm]);
 }
 
 function discoverLanAddresses(cfg) {
@@ -185,6 +221,18 @@ class BmwVoiceDaemon {
         this.wakeStatus = 'off';      // off | paused | armed
         this.micLevels = { leftDb: -60, rightDb: -60 };
         this.audioProbe = MicCapture.probeSmartxStack(this.cfg.micOpts);
+        this.offlineProbe = OfflineAi.probeOfflineAi(this.cfg.offlineDir);
+        this.offlineWorker = new OfflineAi.OfflineWorkerClient({
+            offlineDir: this.cfg.offlineDir,
+            workDir: this.cfg.run,
+            mguPython: (this.cfg.micOpts && this.cfg.micOpts.mguPython) || undefined,
+            onLog: (m) => this.log(m),
+            onReadyChange: (st) => {
+                this.scheduleStatusWrite();
+                if (st && st.ttsReady) this.scheduleTtsPrewarm();
+            },
+        });
+        this.prewarmTimer = null;
         this.lastTurn = {
             at: Date.now(),
             ok: true,
@@ -233,17 +281,21 @@ class BmwVoiceDaemon {
 
         this.micStream = new MicCapture.MicStreamEngine(Object.assign({
             workDir: this.cfg.run,
+            offlineDir: this.cfg.offlineDir,
             swapChannels: this.settings.swapMicChannels,
             connectAmRoute: (r) => this.car.connectAudioRoute(r),
             disconnectAmRoute: (cid) => this.car.disconnectAudioRoute(cid),
-            shouldPause: () => !this.settings.handsFreeWake || !this.settings.apiKey || !!this.car.state.callActive,
+            shouldPause: () => !this.settings.handsFreeWake || !this.canHandleVoice() || !!this.car.state.callActive,
             onSpeechHint: () => {
-                if (!this.cfg.simMode && this.settings.apiKey) {
+                if (!this.cfg.simMode && this.settings.apiKey && !(this.offlineProbe && this.offlineProbe.hasStt)) {
                     Up.warmup(this.uplinkOpts).catch(() => {});
                 }
             },
             onMicLevel: (db) => {
                 this.overlay.updateMicLevel(db);
+            },
+            onLocalWake: (ev) => {
+                this.onLocalWakeDetected(ev).catch((e) => this.log('Local wake err: ' + e.message));
             },
             onWakeUtterance: (utt) => {
                 this.onHeyBmwCandidate(utt).catch((e) => this.log('Hey BMW err: ' + e.message));
@@ -254,6 +306,61 @@ class BmwVoiceDaemon {
             },
             onLog: (m) => this.log(m),
         }, this.cfg.micOpts || {}));
+    }
+
+    canHandleVoice() {
+        return !!this.settings.apiKey || !!(this.offlineProbe && this.offlineProbe.hasStt);
+    }
+
+    scheduleTtsPrewarm() {
+        if (this.cfg.simMode || this.prewarmTimer || !this.offlineWorker || !this.offlineWorker.ttsReady) return;
+        const phrases = [
+            'Xin chào, tôi đang lắng nghe',
+            'Xin lỗi, tôi chưa hiểu lệnh này.',
+            'Đã tăng âm lượng loa',
+            'Đã giảm âm lượng loa',
+            'Đã tắt tiếng loa',
+            'Đã bật lại tiếng loa',
+            'Đã chuyển sang bài tiếp theo',
+            'Đã lùi về bài trước',
+            'Đã tạm dừng nhạc',
+            'Đã tiếp tục phát nhạc',
+            'Đã đổi đèn viền sang Trắng',
+            'Đã đổi đèn viền sang Cam B M W',
+            'Đã bật sấy kính chắn gió',
+            'Đã bật Max điều hòa lạnh sâu',
+        ];
+        const cacheDir = path.join(this.cfg.state, 'tts-cache');
+        mkdirp(cacheDir);
+        let idx = 0;
+        const step = () => {
+            this.prewarmTimer = null;
+            if (!this.offlineWorker || !this.offlineWorker.running || !this.offlineWorker.ttsReady) return;
+            while (idx < phrases.length) {
+                const rawPhrase = phrases[idx++];
+                const text = NluBrain.formatOfflineSpeechTextVi(rawPhrase);
+                if (!text) continue;
+                const hash = crypto.createHash('sha1').update('v4:piper:' + text).digest('hex').slice(0, 16);
+                const file = path.join(cacheDir, hash + '.wav');
+                if (fs.existsSync(file)) continue;
+                if (this.turnBusy || this.assistantState !== 'idle' || this.car.state.speedKmh > 2) {
+                    idx--;
+                    this.prewarmTimer = setTimeout(step, 8000);
+                    if (this.prewarmTimer.unref) this.prewarmTimer.unref();
+                    return;
+                }
+                this.offlineWorker.synthesize({ text, timeoutMs: 22000 }).then((tts) => {
+                    if (tts && tts.wavBuffer) {
+                        try { writeAtomic(file, tts.wavBuffer, 0o644); } catch (e) {}
+                    }
+                    this.prewarmTimer = setTimeout(step, 6000);
+                    if (this.prewarmTimer.unref) this.prewarmTimer.unref();
+                }).catch(() => {});
+                return;
+            }
+        };
+        this.prewarmTimer = setTimeout(step, 3500);
+        if (this.prewarmTimer.unref) this.prewarmTimer.unref();
     }
 
     log(msg) {
@@ -301,8 +408,176 @@ class BmwVoiceDaemon {
             model: this.settings.model,
             pttTrigger: this.settings.pttTrigger,
             handsFreeWake: !!this.settings.handsFreeWake,
+            voiceReply: !!this.settings.voiceReply,
             swapMicChannels: this.settings.swapMicChannels,
         };
+    }
+
+    async playWakeChime() {
+        if (this.cfg.simMode || !this.settings.voiceReply || this.car.state.callActive) return false;
+        const chimePath = path.join(this.cfg.run, 'chime.wav');
+        try {
+            if (!fs.existsSync(chimePath)) {
+                writeAtomic(chimePath, buildWakeChimeWav(), 0o644);
+            }
+            this.micStream.holdCooldown(500);
+            return await this.car.playOverlayWav(chimePath, 240);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /* Natural Gemini voice for next time: after a Piper fallback, fetch it in the background and cache it. */
+    fillGeminiTts(spoken, gemFile) {
+        if (this._ttsFillBusy || !this.settings.apiKey || fs.existsSync(gemFile)) return;
+        this._ttsFillBusy = true;
+        NluBrain.synthesizeVietnameseTts({
+            text: spoken,
+            apiKey: this.settings.apiKey,
+            uplinkOpts: this.uplinkOpts,
+            timeoutMs: 25000,
+            log: (m) => this.log(m),
+        }).then((g) => {
+            if (g && g.wavBuffer) {
+                try { writeAtomic(gemFile, g.wavBuffer, 0o644); this.log('TTS cache filled (' + g.model + '): "' + spoken + '"'); } catch (e) {}
+            }
+        }).catch(() => {}).then(() => { this._ttsFillBusy = false; });
+    }
+
+    /* Piper reads Vietnamese syllable by syllable; shorten the inner gaps to <= 30 ms (PCM16 mono only). */
+    compressPauses(buf) {
+        try {
+            if (!buf || buf.length < 1000 || buf.toString('ascii', 0, 4) !== 'RIFF') return buf;
+            let off = 12, fmt = null, dOff = -1, dLen = 0;
+            while (off + 8 <= buf.length) {
+                const id = buf.toString('ascii', off, off + 4);
+                const len = buf.readUInt32LE(off + 4);
+                if (id === 'fmt ') fmt = { ch: buf.readUInt16LE(off + 10), sr: buf.readUInt32LE(off + 12), bits: buf.readUInt16LE(off + 22) };
+                if (id === 'data') { dOff = off + 8; dLen = Math.min(len, buf.length - dOff); break; }
+                off += 8 + len + (len & 1);
+            }
+            if (!fmt || fmt.ch !== 1 || fmt.bits !== 16 || dOff < 0) return buf;
+            const n = dLen >> 1;
+            const win = Math.max(1, Math.round(fmt.sr * 0.005));
+            let peak = 0;
+            for (let i = 0; i < n; i++) { const v = Math.abs(buf.readInt16LE(dOff + 2 * i)); if (v > peak) peak = v; }
+            if (!peak) return buf;
+            const th = peak * 0.04;
+            const keepWins = 6;
+            const nw = Math.ceil(n / win);
+            const loud = new Array(nw);
+            for (let w = 0; w < nw; w++) {
+                let m = 0;
+                for (let i = w * win; i < Math.min(n, (w + 1) * win); i++) { const v = Math.abs(buf.readInt16LE(dOff + 2 * i)); if (v > m) m = v; }
+                loud[w] = m >= th;
+            }
+            const first = loud.indexOf(true), last = loud.lastIndexOf(true);
+            if (first < 0) return buf;
+            const parts = [];
+            let quiet = 0;
+            for (let w = 0; w < nw; w++) {
+                if (w > first && w < last && !loud[w]) { quiet++; if (quiet > keepWins) continue; } else quiet = 0;
+                parts.push(buf.slice(dOff + 2 * w * win, dOff + 2 * Math.min(n, (w + 1) * win)));
+            }
+            const pcm = Buffer.concat(parts);
+            const hdr = Buffer.alloc(44);
+            hdr.write('RIFF', 0); hdr.writeUInt32LE(36 + pcm.length, 4); hdr.write('WAVE', 8); hdr.write('fmt ', 12);
+            hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(1, 20); hdr.writeUInt16LE(1, 22); hdr.writeUInt32LE(fmt.sr, 24);
+            hdr.writeUInt32LE(fmt.sr * 2, 28); hdr.writeUInt16LE(2, 32); hdr.writeUInt16LE(16, 34); hdr.write('data', 36); hdr.writeUInt32LE(pcm.length, 40);
+            return Buffer.concat([hdr, pcm]);
+        } catch (e) {
+            return buf;
+        }
+    }
+
+    async speakReply(rawText) {
+        const hasOfflineTts = !!(this.offlineProbe && this.offlineProbe.hasTts);
+        if (this.cfg.simMode || !this.settings.voiceReply || this.car.state.callActive || (!hasOfflineTts && !this.settings.apiKey)) {
+            return false;
+        }
+        const spoken = /^Chưa nhận diện được lệnh điều khiển xe/.test(String(rawText || ''))
+            ? 'Xin lỗi, tôi chưa hiểu lệnh này.'
+            : NluBrain.formatSpeechTextVi(rawText);
+        if (!spoken) return false;
+        try {
+            const cacheDir = path.join(this.cfg.state, 'tts-cache');
+            mkdirp(cacheDir);
+            const offlineSpoken = NluBrain.formatOfflineSpeechTextVi(spoken);
+            const hasKey = !!this.settings.apiKey;
+            const gemFile = path.join(cacheDir, crypto.createHash('sha1').update('v4:gem:' + spoken).digest('hex').slice(0, 16) + '.wav');
+            const piperFile = path.join(cacheDir, crypto.createHash('sha1').update('v5:piper:' + offlineSpoken).digest('hex').slice(0, 16) + '.wav');
+            let cacheFile = hasKey ? gemFile : piperFile;
+            let wavBuf = null;
+            let durMs = 2400;
+
+            if (hasKey && fs.existsSync(gemFile)) {
+                wavBuf = fs.readFileSync(gemFile);
+                const hdrInfo = OfflineAi.readWavHeaderInfo(wavBuf);
+                durMs = hdrInfo.durationMs || Math.round((Math.max(0, wavBuf.length - 44) / 48000) * 1000);
+                this.log('TTS cache hit (gem, ' + durMs + 'ms): "' + spoken + '"');
+            } else {
+                let tts = null;
+                if (hasKey) {
+                    tts = await NluBrain.synthesizeVietnameseTts({
+                        text: spoken,
+                        apiKey: this.settings.apiKey,
+                        uplinkOpts: this.uplinkOpts,
+                        timeoutMs: 8000,
+                        log: (m) => this.log(m),
+                    });
+                    if (tts && tts.wavBuffer) cacheFile = gemFile;
+                }
+                if (!tts && hasOfflineTts && fs.existsSync(piperFile)) {
+                    wavBuf = fs.readFileSync(piperFile);
+                    const hdrInfo = OfflineAi.readWavHeaderInfo(wavBuf);
+                    durMs = hdrInfo.durationMs || Math.round((Math.max(0, wavBuf.length - 44) / 44100) * 1000);
+                    this.log('TTS cache hit (piper, ' + durMs + 'ms): "' + offlineSpoken + '"');
+                    if (hasKey) this.fillGeminiTts(spoken, gemFile);
+                } else if (!tts && hasOfflineTts && this.offlineWorker && this.offlineWorker.ttsReady) {
+                    tts = await OfflineAi.synthesizeOfflineViTts({
+                        text: offlineSpoken,
+                        offlineDir: this.cfg.offlineDir,
+                        workDir: this.cfg.run,
+                        worker: this.offlineWorker,
+                    });
+                    if (tts && tts.wavBuffer) cacheFile = piperFile;
+                }
+                if (!wavBuf && tts && tts.wavBuffer) {
+                    wavBuf = /^piper/.test(String(tts.model || '')) ? this.compressPauses(tts.wavBuffer) : tts.wavBuffer;
+                    durMs = tts.durationMs || 2600;
+                    this.log('TTS generated (' + tts.model + ', ' + durMs + 'ms' + (tts.elapsedMs ? (', gen=' + tts.elapsedMs + 'ms') : '') + '): "' + (tts.spoken || spoken) + '"');
+                    try {
+                        writeAtomic(cacheFile, wavBuf, 0o644);
+                        if (hasKey && cacheFile !== gemFile) this.fillGeminiTts(spoken, gemFile);
+                        // Prune oldest cached WAVs if > 48 entries (~6 MB cap)
+                        const files = fs.readdirSync(cacheDir).filter((f) => /\.wav$/.test(f));
+                        if (files.length > 48) {
+                            const stats = files.map((f) => {
+                                const p = path.join(cacheDir, f);
+                                try { return { p, mt: fs.statSync(p).mtimeMs }; } catch (e) { return { p, mt: 0 }; }
+                            }).sort((a, b) => a.mt - b.mt);
+                            for (let i = 0; i < stats.length - 40; i++) {
+                                try { fs.unlinkSync(stats[i].p); } catch (e) {}
+                            }
+                        }
+                    } catch (e) {}
+                }
+                if (!wavBuf) return false;
+            }
+
+            if (this.car.state.callActive || this.assistantState === 'listening') return false;
+            const outWav = path.join(this.cfg.run, 'reply_tts.wav');
+            writeAtomic(outWav, wavBuf, 0o644);
+            // Prevent the ceiling mic from hearing our own TTS reply and re-triggering "Hey BMW"
+            this.micStream.holdCooldown(durMs + 1100);
+            if (this.overlay.phase === 'result' && this.shouldShowOverlay()) {
+                this.overlay.extendHide(durMs + 900);
+            }
+            return await this.car.playOverlayWav(outWav, durMs);
+        } catch (e) {
+            this.log('TTS speak warn: ' + e.message);
+            return false;
+        }
     }
 
     saveSettings(patch) {
@@ -352,11 +627,21 @@ class BmwVoiceDaemon {
                 fuelPercent: st.fuelPercent,
                 rangeKm: st.rangeKm,
                 callActive: !!st.callActive,
+                callRaw: st.callRaw || null,
             },
             audio: {
                 hasAlsaCapture: !!this.audioProbe.hasAlsaCapture,
                 device: this.micStream.activeDevice || this.audioProbe.recommendedDevice || '',
             },
+            offline: {
+                kws: !!(this.offlineProbe && this.offlineProbe.hasKws),
+                stt: !!(this.offlineProbe && this.offlineProbe.hasStt),
+                sttWarm: !!(this.offlineWorker && this.offlineWorker.sttReady),
+                tts: !!(this.offlineProbe && this.offlineProbe.hasTts),
+                ttsWarm: !!(this.offlineWorker && this.offlineWorker.ttsReady),
+                kwsMode: this.micStream.kwsMode || 'cloud_vad',
+            },
+            hasVoiceReady: this.canHandleVoice(),
             lastTurn: this.lastTurn,
         };
     }
@@ -410,22 +695,144 @@ class BmwVoiceDaemon {
         this.captureAndExecute({ fromSteeringWheel: true }).catch((e) => this.log('PTT error: ' + e.message));
     }
 
+    async onLocalWakeDetected(ev) {
+        if (this.turnBusy || this.assistantState !== 'idle') return;
+        if (!this.settings.handsFreeWake || !this.canHandleVoice() || this.car.state.callActive) return;
+
+        this.wakeEpoch++;
+        this.turnBusy = true;
+        const zone = (ev && ev.speakerZone === 'passenger') ? 'passenger' : 'driver';
+        this.micLevels = {
+            leftDb: (ev && typeof ev.leftDb === 'number') ? ev.leftDb : -30,
+            rightDb: (ev && typeof ev.rightDb === 'number') ? ev.rightDb : -30,
+        };
+
+        try {
+            this.log('Offline KWS wake (' + ((ev && ev.keyword) || 'HEY_BMW') + ', ' + zone + ') -> instant assistant');
+            this.assistantState = 'listening';
+            this.listenStartedAt = Date.now();
+            this.lastTurn = {
+                at: Date.now(),
+                ok: true,
+                idle: false,
+                speakerZone: zone,
+                transcript: 'Hey BMW',
+                replyVi: 'Xin chào, tôi đang lắng nghe…',
+                actions: [],
+            };
+            // Paint full-screen IPA overlay IMMEDIATELY (<5ms after keyword detected)
+            if (this.shouldShowOverlay()) {
+                this.overlay.showListening({
+                    wakeTriggered: true,
+                    speakerZone: zone,
+                    headline: 'Xin chào, tôi đang lắng nghe…',
+                    subline: 'Mời nói câu lệnh Tiếng Việt · Ví dụ: "Điều hòa 22 độ", "Đèn màu cam", "Qua bài"',
+                });
+            }
+            this.car.pulseIpaLight(zone === 'passenger' ? 'listenPassenger' : 'listenDriver').catch(() => {});
+            this.writeStatusFile(true);
+            if (this.car.state.gear !== 'R') {
+                this.pushHmiEvent('open', { reason: 'hey_bmw' });
+            }
+
+            await this.car.duckMusicForListening({
+                hasRefChannel: this.micStream.hasRefChannel,
+                speakerPlaying: this.micStream.speakerPlaying,
+            });
+            await this.playWakeChime();
+
+            let followCap;
+            try {
+                followCap = await this.micStream.capturePtt({
+                    maxDurationSec: 5.0,
+                    noPreroll: true,
+                    outFile: path.join(this.cfg.run, 'capture.wav'),
+                });
+            } finally {
+                await this.car.restoreMusicAfterListening();
+            }
+            try { fs.writeFileSync(path.join(this.cfg.run, 'last_ptt.wav'), followCap.wavBuffer); } catch (e) {}
+            this.log('Wake follow-up clip: dur=' + followCap.analysis.durationMs + 'ms ch=' + followCap.analysis.channels
+                + ' L=' + followCap.analysis.leftDb + 'dB R=' + followCap.analysis.rightDb + 'dB snr=' + followCap.snrDb
+                + ' voiced=' + followCap.voicedChunks);
+            const followZone = (followCap.analysis && followCap.analysis.speakerZone === 'passenger') ? 'passenger' : zone;
+            this.micLevels = {
+                leftDb: followCap.analysis.leftDb,
+                rightDb: followCap.analysis.rightDb,
+            };
+            this.assistantState = 'thinking';
+            this.writeStatusFile(true);
+            if (this.shouldShowOverlay()) {
+                this.overlay.showThinking({ speakerZone: followZone });
+            }
+
+            const followTurn = (followCap.voicedChunks === 0 && typeof followCap.snrDb === 'number' && followCap.snrDb < 2.8)
+                ? {
+                    at: Date.now(),
+                    ok: false,
+                    speakerZone: followZone,
+                    transcript: '',
+                    replyVi: 'Chưa nghe thấy câu lệnh - mời gọi "Hey BMW" rồi nói rõ lệnh điều khiển.',
+                    actions: [],
+                }
+                : await NluBrain.processVoiceOrText({
+                    audioWavBase64: followCap.wavBuffer.toString('base64'),
+                    audioMimeType: 'audio/wav',
+                    speakerZone: followZone,
+                    wakeMode: false,
+                    apiKey: this.settings.apiKey,
+                    model: this.settings.model,
+                    offlineDir: this.cfg.offlineDir,
+                    offlineWorker: this.offlineWorker,
+                    workDir: this.cfg.run,
+                    carController: this.car,
+                    uplinkOpts: this.uplinkOpts,
+                });
+
+            this.log('Wake result (' + (followTurn.engine || '') + '): ok=' + !!followTurn.ok
+                + ' tr="' + (followTurn.transcript || '') + '" -> "' + (followTurn.replyVi || '') + '"');
+            this.lastTurn = followTurn;
+            this.assistantState = 'idle';
+            this.car.pulseIpaLight('off').catch(() => {});
+            this.writeStatusFile(true);
+            this.pushHmiEvent('finish', { holdMs: 3600 });
+            if (this.shouldShowOverlay()) {
+                this.overlay.showResult(followTurn, 3600);
+            }
+            this.speakReply(followTurn.replyVi).catch(() => {});
+        } catch (e) {
+            this.assistantState = 'idle';
+            this.overlay.hide();
+            this.car.pulseIpaLight('off').catch(() => {});
+            this.pushHmiEvent('finish', { holdMs: 2200 });
+            this.log('Local wake follow-up warn: ' + e.message);
+        } finally {
+            this.assistantState = 'idle';
+            this.turnBusy = false;
+        }
+    }
+
     async onHeyBmwCandidate(utt) {
         if (this.turnBusy || this.wakeCheckBusy || this.assistantState !== 'idle') return;
-        if (!this.settings.handsFreeWake || !this.settings.apiKey || this.car.state.callActive) return;
+        if (!this.settings.handsFreeWake || !this.canHandleVoice() || this.car.state.callActive) return;
 
         const myEpoch = ++this.wakeEpoch;
         this.wakeCheckBusy = true;
         let turn = null;
         const zone = (utt.analysis && utt.analysis.speakerZone === 'passenger') ? 'passenger' : 'driver';
+        const isShortWakeClip = !!(utt && typeof utt.durationMs === 'number' && utt.durationMs > 0 && utt.durationMs <= 1950);
         try {
             turn = await NluBrain.processVoiceOrText({
                 audioWavBase64: utt.wavBuffer.toString('base64'),
                 audioMimeType: 'audio/wav',
                 speakerZone: zone,
                 wakeMode: true,
+                fastWakeOnly: isShortWakeClip,
                 apiKey: this.settings.apiKey,
                 model: this.settings.model,
+                offlineDir: this.cfg.offlineDir,
+                offlineWorker: this.offlineWorker,
+                workDir: this.cfg.run,
                 carController: this.car,
                 uplinkOpts: this.uplinkOpts,
             });
@@ -447,6 +854,8 @@ class BmwVoiceDaemon {
 
         // 1. Cabin chatter without "Hey BMW" -> silently ignore (zero UI popups, zero status churn)
         if (!turn || turn.ignored) {
+            this.log('Wake clip ignored: dur=' + (utt.durationMs || 0) + 'ms snr=' + (utt.snrDb || 0)
+                + ' tr="' + ((turn && turn.transcript) || '') + '"');
             return;
         }
 
@@ -471,25 +880,39 @@ class BmwVoiceDaemon {
                     replyVi: 'Xin chào, tôi đang lắng nghe…',
                     actions: [],
                 };
-                this.writeStatusFile(true);
-                if (this.car.state.gear !== 'R') {
-                    this.pushHmiEvent('open', { reason: 'hey_bmw' });
-                }
-                this.car.pulseIpaLight(zone === 'passenger' ? 'listenPassenger' : 'listenDriver').catch(() => {});
                 if (this.shouldShowOverlay()) {
                     this.overlay.showListening({
                         wakeTriggered: true,
                         speakerZone: zone,
                         headline: 'Xin chào, tôi đang lắng nghe…',
-                        subline: 'Mời nói câu lệnh Tiếng Việt · Ví dụ: "Điều hoà 22 độ", "Đèn màu cam", "Qua bài"',
+                        subline: 'Mời nói câu lệnh Tiếng Việt · Ví dụ: "Điều hòa 22 độ", "Đèn màu cam", "Qua bài"',
                     });
                 }
+                this.writeStatusFile(true);
+                if (this.car.state.gear !== 'R') {
+                    this.pushHmiEvent('open', { reason: 'hey_bmw' });
+                }
+                this.car.pulseIpaLight(zone === 'passenger' ? 'listenPassenger' : 'listenDriver').catch(() => {});
+                await this.car.duckMusicForListening({
+                hasRefChannel: this.micStream.hasRefChannel,
+                speakerPlaying: this.micStream.speakerPlaying,
+            });
+                await this.playWakeChime();
 
-                const followCap = await this.micStream.capturePtt({
-                    maxDurationSec: 4.2,
-                    noPreroll: true,
-                    outFile: path.join(this.cfg.run, 'capture.wav'),
-                });
+                let followCap;
+                try {
+                    followCap = await this.micStream.capturePtt({
+                        maxDurationSec: 5.0,
+                        noPreroll: true,
+                        outFile: path.join(this.cfg.run, 'capture.wav'),
+                    });
+                } finally {
+                    await this.car.restoreMusicAfterListening();
+                }
+                try { fs.writeFileSync(path.join(this.cfg.run, 'last_ptt.wav'), followCap.wavBuffer); } catch (e) {}
+                this.log('Follow-up clip: dur=' + followCap.analysis.durationMs + 'ms ch=' + followCap.analysis.channels
+                    + ' L=' + followCap.analysis.leftDb + 'dB R=' + followCap.analysis.rightDb + 'dB snr=' + followCap.snrDb
+                    + ' voiced=' + followCap.voicedChunks);
                 const followZone = (followCap.analysis && followCap.analysis.speakerZone === 'passenger') ? 'passenger' : zone;
                 this.micLevels = {
                     leftDb: followCap.analysis.leftDb,
@@ -501,7 +924,7 @@ class BmwVoiceDaemon {
                     this.overlay.showThinking({ speakerZone: followZone });
                 }
 
-                const followTurn = (followCap.voicedChunks === 0 && typeof followCap.snrDb === 'number' && followCap.snrDb < 4.0)
+                const followTurn = (followCap.voicedChunks === 0 && typeof followCap.snrDb === 'number' && followCap.snrDb < 2.8)
                     ? {
                         at: Date.now(),
                         ok: false,
@@ -517,18 +940,24 @@ class BmwVoiceDaemon {
                         wakeMode: false,
                         apiKey: this.settings.apiKey,
                         model: this.settings.model,
+                        offlineDir: this.cfg.offlineDir,
+                        offlineWorker: this.offlineWorker,
+                        workDir: this.cfg.run,
                         carController: this.car,
                         uplinkOpts: this.uplinkOpts,
                     });
 
+                this.log('Follow-up result (' + (followTurn.engine || '') + '): ok=' + !!followTurn.ok
+                    + ' tr="' + (followTurn.transcript || '') + '" -> "' + (followTurn.replyVi || '') + '"');
                 this.lastTurn = followTurn;
                 this.assistantState = 'idle';
                 this.car.pulseIpaLight('off').catch(() => {});
                 this.writeStatusFile(true);
-                this.pushHmiEvent('finish', { holdMs: 3200 });
+                this.pushHmiEvent('finish', { holdMs: 3600 });
                 if (this.shouldShowOverlay()) {
-                    this.overlay.showResult(followTurn, 3200);
+                    this.overlay.showResult(followTurn, 3600);
                 }
+                this.speakReply(followTurn.replyVi).catch(() => {});
                 return;
             }
 
@@ -539,10 +968,11 @@ class BmwVoiceDaemon {
             setTimeout(() => this.car.pulseIpaLight('off').catch(() => {}), 1400);
             this.writeStatusFile(true);
             if (this.shouldShowOverlay() && this.overlay.ready) {
-                this.overlay.showResult(turn, 3400);
+                this.overlay.showResult(turn, 3800);
             } else if (!this.hmiAppVisible && this.car.state.gear !== 'R') {
-                this.pushHmiEvent('open_result', { holdMs: 3200 });
+                this.pushHmiEvent('open_result', { holdMs: 3600 });
             }
+            this.speakReply(turn.replyVi).catch(() => {});
         } catch (e) {
             this.assistantState = 'idle';
             this.overlay.hide();
@@ -582,8 +1012,8 @@ class BmwVoiceDaemon {
             this.hmiAppVisible = false;
         }
 
-        const hasKey = !!this.settings.apiKey;
-        if (!hasKey) {
+        const canVoice = this.canHandleVoice();
+        if (!canVoice) {
             this.lastTurn = {
                 at: Date.now(),
                 ok: false,
@@ -617,8 +1047,8 @@ class BmwVoiceDaemon {
             return { ok: false, turn: this.lastTurn };
         }
 
-        // Pre-warm TLS 1.3 socket in parallel while user speaks into ceiling mic
-        if (!this.cfg.simMode) {
+        // Pre-warm TLS 1.3 socket in parallel when Gemini cloud is active or offline STT is still warming up
+        if (!this.cfg.simMode && this.settings.apiKey && !(this.offlineWorker && this.offlineWorker.sttReady)) {
             Up.warmup(this.uplinkOpts).catch(() => {});
         }
 
@@ -634,12 +1064,9 @@ class BmwVoiceDaemon {
             replyVi: 'Xin chào, tôi đang lắng nghe…',
             actions: [],
         };
-        this.writeStatusFile(true);
-        if (o.fromSteeringWheel && this.car.state.gear !== 'R') {
-            this.pushHmiEvent('open', { reason: 'ptt' });
-        }
-        this.car.pulseIpaLight('listenDriver').catch(() => {});
 
+        // Paint Wayland IPA overlay FIRST (before any synchronous status file I/O) so it covers
+        // HmiMain3D's native "Nhập bằng giọng nói không khả dụng" popup within ~2ms!
         if (this.shouldShowOverlay()) {
             this.overlay.showListening({
                 reassertTop: !!o.fromSteeringWheel,
@@ -647,19 +1074,37 @@ class BmwVoiceDaemon {
                 speakerZone: 'driver',
             });
         }
+        this.car.pulseIpaLight('listenDriver').catch(() => {});
+        this.writeStatusFile(true);
+        if (o.fromSteeringWheel && this.car.state.gear !== 'R') {
+            this.pushHmiEvent('open', { reason: 'ptt' });
+        }
 
         try {
-            let cap = await this.micStream.capturePtt({
-                maxDurationSec: 4.2,
-                noPreroll: false,
-                outFile: path.join(this.cfg.run, 'capture.wav'),
+            await this.car.duckMusicForListening({
+                hasRefChannel: this.micStream.hasRefChannel,
+                speakerPlaying: this.micStream.speakerPlaying,
             });
+            let cap;
+            try {
+                cap = await this.micStream.capturePtt({
+                    maxDurationSec: 5.0,
+                    noPreroll: false,
+                    outFile: path.join(this.cfg.run, 'capture.wav'),
+                });
+            } finally {
+                await this.car.restoreMusicAfterListening();
+            }
+            try { fs.writeFileSync(path.join(this.cfg.run, 'last_ptt.wav'), cap.wavBuffer); } catch (e) {}
 
             this.micLevels = { leftDb: cap.analysis.leftDb, rightDb: cap.analysis.rightDb };
             let zone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
+            this.log('PTT clip: dur=' + cap.analysis.durationMs + 'ms ch=' + cap.analysis.channels
+                + ' L=' + cap.analysis.leftDb + 'dB R=' + cap.analysis.rightDb + 'dB snr=' + cap.snrDb
+                + ' voiced=' + cap.voicedChunks);
 
             // Reject pure silence/road-hum clips locally without wasting a Gemini roundtrip or risking hallucinations
-            if (cap.voicedChunks === 0 && typeof cap.snrDb === 'number' && cap.snrDb < 3.8) {
+            if (cap.voicedChunks === 0 && typeof cap.snrDb === 'number' && cap.snrDb < 2.8) {
                 const quietTurn = {
                     at: Date.now(),
                     ok: false,
@@ -692,6 +1137,9 @@ class BmwVoiceDaemon {
                 wakeMode: false,
                 apiKey: this.settings.apiKey,
                 model: this.settings.model,
+                offlineDir: this.cfg.offlineDir,
+                offlineWorker: this.offlineWorker,
+                workDir: this.cfg.run,
                 carController: this.car,
                 uplinkOpts: this.uplinkOpts,
             });
@@ -700,7 +1148,9 @@ class BmwVoiceDaemon {
             if (turn && turn.wakeOnly) {
                 this.assistantState = 'listening';
                 this.listenStartedAt = Date.now();
-                this.lastTurn = turn;
+                this.log('PTT result (' + (turn.engine || '') + '): ok=' + !!turn.ok
+                + ' tr="' + (turn.transcript || '') + '" -> "' + (turn.replyVi || '') + '"');
+            this.lastTurn = turn;
                 this.writeStatusFile(true);
                 if (this.shouldShowOverlay()) {
                     this.overlay.showListening({
@@ -709,11 +1159,20 @@ class BmwVoiceDaemon {
                         headline: 'Xin chào, mời nói câu lệnh tiếp theo…',
                     });
                 }
-                cap = await this.micStream.capturePtt({
-                    maxDurationSec: 4.2,
-                    noPreroll: true,
-                    outFile: path.join(this.cfg.run, 'capture.wav'),
+                await this.car.duckMusicForListening({
+                    hasRefChannel: this.micStream.hasRefChannel,
+                    speakerPlaying: this.micStream.speakerPlaying,
                 });
+                await this.playWakeChime();
+                try {
+                    cap = await this.micStream.capturePtt({
+                        maxDurationSec: 4.2,
+                        noPreroll: true,
+                        outFile: path.join(this.cfg.run, 'capture.wav'),
+                    });
+                } finally {
+                    await this.car.restoreMusicAfterListening();
+                }
                 zone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : zone;
                 this.assistantState = 'thinking';
                 this.writeStatusFile(true);
@@ -725,19 +1184,25 @@ class BmwVoiceDaemon {
                     wakeMode: false,
                     apiKey: this.settings.apiKey,
                     model: this.settings.model,
+                    offlineDir: this.cfg.offlineDir,
+                    offlineWorker: this.offlineWorker,
+                    workDir: this.cfg.run,
                     carController: this.car,
                     uplinkOpts: this.uplinkOpts,
                 });
             }
 
+            this.log('PTT result (' + (turn.engine || '') + '): ok=' + !!turn.ok
+                + ' tr="' + (turn.transcript || '') + '" -> "' + (turn.replyVi || '') + '"');
             this.lastTurn = turn;
             this.assistantState = 'idle';
             this.car.pulseIpaLight('off').catch(() => {});
             this.writeStatusFile(true);
-            this.pushHmiEvent('finish', { holdMs: 3200 });
+            this.pushHmiEvent('finish', { holdMs: 3600 });
             if (this.shouldShowOverlay()) {
-                this.overlay.showResult(turn, 3200);
+                this.overlay.showResult(turn, 3600);
             }
+            this.speakReply(turn.replyVi).catch(() => {});
             return { ok: turn.ok, turn };
         } catch (e) {
             this.assistantState = 'idle';
@@ -790,11 +1255,16 @@ class BmwVoiceDaemon {
                 wakeMode: !!req.wakeMode,
                 apiKey: this.settings.apiKey,
                 model: this.settings.model,
+                offlineDir: this.cfg.offlineDir,
+                offlineWorker: this.offlineWorker,
+                workDir: this.cfg.run,
                 carController: this.car,
                 uplinkOpts: this.uplinkOpts,
             });
             if (!turn.ignored && !turn.wakeOnly) {
-                this.lastTurn = turn;
+                this.log('PTT result (' + (turn.engine || '') + '): ok=' + !!turn.ok
+                + ' tr="' + (turn.transcript || '') + '" -> "' + (turn.replyVi || '') + '"');
+            this.lastTurn = turn;
                 this.assistantState = 'idle';
                 this.writeStatusFile(true);
                 if (this.shouldShowOverlay()) {
@@ -1018,6 +1488,9 @@ class BmwVoiceDaemon {
         if (!this.cfg.noWakeStream) {
             this.micStream.start();
         }
+        if (!this.cfg.simMode && this.offlineProbe && (this.offlineProbe.hasStt || this.offlineProbe.hasTts)) {
+            this.offlineWorker.start(os.uptime() < 45 ? 12000 : 1500);
+        }
 
         if (!this.cfg.noNft && !this.cfg.simMode) {
             await fwOpen(this.cfg.nft, this.cfg.port);
@@ -1078,7 +1551,10 @@ class BmwVoiceDaemon {
         if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
         if (this.busInitTimer) { clearTimeout(this.busInitTimer); this.busInitTimer = null; }
         if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
+        if (this.prewarmTimer) { clearTimeout(this.prewarmTimer); this.prewarmTimer = null; }
+        await this.car.restoreMusicAfterListening().catch(() => {});
         await this.micStream.stop();
+        await this.offlineWorker.stop();
         this.overlay.stop();
         Up.close(this.uplinkOpts);
         for (let i = 0; i < this.hmiClients.length; i++) {

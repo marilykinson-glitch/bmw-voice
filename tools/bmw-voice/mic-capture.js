@@ -19,6 +19,7 @@ const cp = require('child_process');
 
 const MGU_PYTHON = '/var/opt/mgu-python/current/bin/python3';
 const SMARTX_HELPER = path.join(__dirname, 'alsa-smartx.py');
+const DEFAULT_OFFLINE_DIR = process.env.BV_OFFLINE_DIR || '/var/opt/bmw-voice/offline';
 
 const SMARTX_PROFILES = [
     {
@@ -305,6 +306,7 @@ class MicStreamEngine {
             smartxHelper: SMARTX_HELPER,
             smartxDir: '/run/smartx',
             workDir: '/run/bmw-voice',
+            offlineDir: DEFAULT_OFFLINE_DIR,
             swapChannels: false,
             minUptimeSec: isCustomPy ? 0 : 45,
             connectAmRoute: null,
@@ -312,6 +314,7 @@ class MicStreamEngine {
             shouldPause: () => false,
             onSpeechHint: null,
             onMicLevel: null,
+            onLocalWake: null,
             onWakeUtterance: null,
             onStatusChange: null,
             onLog: () => {},
@@ -322,6 +325,10 @@ class MicStreamEngine {
         this.child = null;
         this.routeToken = null;
         this.activeDevice = '';
+        this.kwsMode = 'cloud_vad';
+        this.hasRefChannel = false;
+        this.speakerPlaying = false;
+        this.lastRefDb = -90.0;
         this.status = 'off'; // off | paused | armed
         this.profileIdx = 0;
         this.consecutiveFails = 0;
@@ -440,6 +447,14 @@ class MicStreamEngine {
             }
 
             this.stdoutBuf = '';
+            const spawnEnv = Object.assign({}, process.env);
+            if (this.opts.offlineDir) {
+                const libDir = path.join(this.opts.offlineDir, 'lib');
+                if (fs.existsSync(libDir)) {
+                    spawnEnv.LD_LIBRARY_PATH = libDir + (spawnEnv.LD_LIBRARY_PATH ? (':' + spawnEnv.LD_LIBRARY_PATH) : '');
+                }
+                spawnEnv.BV_OFFLINE_DIR = String(this.opts.offlineDir);
+            }
             const child = cp.spawn(this.opts.mguPython, [
                 this.opts.smartxHelper,
                 '--stream-daemon',
@@ -447,7 +462,8 @@ class MicStreamEngine {
                 String(this.opts.workDir),
                 String(cand.rate || 24000),
                 String(cand.hwChannels || 8),
-            ], { stdio: ['pipe', 'pipe', 'ignore'] });
+                String(this.opts.offlineDir || ''),
+            ], { stdio: ['pipe', 'pipe', 'ignore'], env: spawnEnv });
 
             this.child = child;
             this.activeDevice = cand.hw;
@@ -503,8 +519,30 @@ class MicStreamEngine {
         if (ev.event === 'ready') {
             lastWorkingHw = cand.hw;
             this.consecutiveFails = 0;
+            this.kwsMode = ev.kwsMode || 'cloud_vad';
+            this.hasRefChannel = !!ev.hasRefChannel;
+            this.speakerPlaying = false;
             this.setStatus('armed');
-            this.opts.onLog('Hey BMW stream armed on ' + cand.hw);
+            this.opts.onLog('Hey BMW stream armed on ' + cand.hw + ' (kws=' + this.kwsMode + (ev.kwsError ? (', err=' + ev.kwsError) : '') + ')');
+        } else if (ev.event === 'speaker_state') {
+            this.speakerPlaying = !!ev.playing;
+            if (typeof ev.refDb === 'number') this.lastRefDb = ev.refDb;
+        } else if (ev.event === 'local_wake') {
+            if (this.pendingPtt) return;
+            const rawL = typeof ev.leftDb === 'number' ? ev.leftDb : -35;
+            const rawR = typeof ev.rightDb === 'number' ? ev.rightDb : -35;
+            const driverDb = this.opts.swapChannels ? rawR : rawL;
+            const passDb = this.opts.swapChannels ? rawL : rawR;
+            const speakerZone = (passDb - driverDb >= 2.5 && passDb > -50) ? 'passenger' : 'driver';
+            if (this.opts.onLocalWake) {
+                this.opts.onLocalWake({
+                    keyword: ev.keyword || 'HEY_BMW',
+                    speakerZone,
+                    leftDb: driverDb,
+                    rightDb: passDb,
+                    deviceUsed: ev.device || cand.hw,
+                });
+            }
         } else if (ev.event === 'speech_hint') {
             if (this.opts.onSpeechHint) this.opts.onSpeechHint();
         } else if (ev.event === 'mic_level') {

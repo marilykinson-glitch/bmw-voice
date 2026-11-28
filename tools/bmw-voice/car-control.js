@@ -32,15 +32,16 @@ const APPMGMTS = [
     '/usr/lib/oap-mainapp21/src/AppManagement/AppManagement.js',
 ];
 
-// Official BMW iDrive 7 (`ComfortFunctionIuK`) Ambient Menu Slots (`FARBAUSWAHL_1..11`)
+// Official BMW iDrive 7 (`ComfortFunctionIuK`) 11-slot Ambient Menu (`FARBAUSWAHL_1..11`)
+// 1=Bronze, 2=Bronze/White, 3=Orange, 4=Orange/White, 5=White, 6=Blue, 7=Blue/White, 8=Green, 9=Green/White, 10=Lilac, 11=Lilac/White
 const OEM_AMBIENT_COLORS = {
     bronze: { name: 'Đồng Bronze', hex: '#D97706', r: 217, g: 119, b: 6, menuIdx: 1 },
     orange: { name: 'Cam BMW', hex: '#FF5500', r: 254, g: 85, b: 0, menuIdx: 3 },
     white: { name: 'Trắng', hex: '#F1F5F9', r: 241, g: 245, b: 249, menuIdx: 5 },
-    blue: { name: 'Xanh BMW', hex: '#0066FF', r: 0, g: 102, b: 254, menuIdx: 7 },
-    cyan: { name: 'Xanh băng', hex: '#00D4FF', r: 0, g: 212, b: 254, menuIdx: 8 },
-    green: { name: 'Xanh lá', hex: '#22C55E', r: 34, g: 197, b: 94, menuIdx: 9 },
-    lilac: { name: 'Tím Lilac', hex: '#A855F7', r: 168, g: 85, b: 247, menuIdx: 11 },
+    blue: { name: 'Xanh BMW', hex: '#0066FF', r: 0, g: 102, b: 254, menuIdx: 6 },
+    cyan: { name: 'Xanh băng', hex: '#00D4FF', r: 0, g: 212, b: 254, menuIdx: 7 },
+    green: { name: 'Xanh lá', hex: '#22C55E', r: 34, g: 197, b: 94, menuIdx: 8 },
+    lilac: { name: 'Tím Lilac', hex: '#A855F7', r: 168, g: 85, b: 247, menuIdx: 10 },
     red: { name: 'Đỏ / Cam thể thao', hex: '#FF2E4C', r: 254, g: 30, b: 56, menuIdx: 3, customRgbOnly: true },
 };
 
@@ -236,6 +237,32 @@ function sendOptionalComfortRgb(sockPath, payload) {
     });
 }
 
+/**
+ * Decide whether a BMW / projection telephony state value means a call is in progress.
+ * Accepts booleans, numbers, strings and SOME/IP structs (objects / arrays).
+ * Only clearly active states count: ringing, dialing, alerting, active, held, connected.
+ */
+function isCallStateActive(v, depth) {
+    const d = depth || 0;
+    if (v === null || v === undefined || d > 4) return false;
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'number') return v > 1 && v < 32;
+    if (typeof v === 'string') {
+        const u = v.toUpperCase();
+        if (/IDLE|NONE|INACTIVE|DISCONNECT|TERMINAT|ENDED|RELEASED|OFF|INVALID|UNKNOWN|NO_CALL|NOCALL/.test(u)) return false;
+        return /RING|DIAL|ALERT|INCOM|OUTGO|ACTIVE|HELD|HOLD|CONNECT|WAIT|CALLING|BUSY/.test(u);
+    }
+    if (Array.isArray(v)) return v.some((x) => isCallStateActive(x, d + 1) === true);
+    if (typeof v === 'object') {
+        const keys = ['state', 'callState', 'status', 'value', 'active', 'isActive'];
+        for (let i = 0; i < keys.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(v, keys[i])) return isCallStateActive(v[keys[i]], d + 1) === true;
+        }
+        return Object.keys(v).some((k) => isCallStateActive(v[k], d + 1) === true);
+    }
+    return false;
+}
+
 class CarController {
     constructor(opts) {
         this.opts = Object.assign({
@@ -263,6 +290,9 @@ class CarController {
         this.lastSpeedEmitAt = 0;
         this.lastProxyRefreshAt = 0;
         this._nativeChain = Promise.resolve();
+        this._overlayChain = Promise.resolve();
+        this._duckSavedVol = null;
+        this._playerStates = {};
     }
 
     log(msg) {
@@ -353,13 +383,10 @@ class CarController {
         const fire = () => {
             this.callMethodIfAvailable('speechPrompter', 'abortPrompt', {}).catch(() => {});
             this.callMethodIfAvailable('voicePrompt', 'abort', {}).catch(() => {});
-            this.callMethodIfAvailable('speechDialog', 'abortDialog', {}).catch(() => {});
-            this.callMethodIfAvailable('speechDialog', 'abort', {}).catch(() => {});
-            this.callMethodIfAvailable('speechDialog', 'cancelDialog', {}).catch(() => {});
-            this.callMethodIfAvailable('speechDialog', 'stopDialog', {}).catch(() => {});
+            this.callMethodIfAvailable('speechRecognizer', 'abortRecognition', {}).catch(() => {});
         };
         fire();
-        [70, 180, 360, 650].forEach((ms) => {
+        [60, 160, 320, 600].forEach((ms) => {
             const t = setTimeout(fire, ms);
             if (t.unref) t.unref();
         });
@@ -444,11 +471,23 @@ class CarController {
         if (!(await this.isProxyAvailable(proxyKey))) return { ok: false, reason: 'unavailable' };
         const px = this.proxies[proxyKey];
         const coercedArgs = this.coerceMethodArgs(proxyKey, methodName, payload);
+        const ifaceName = this.proxyIfaceMap[proxyKey];
+        const iv = this.db && this.db.interfaces && ifaceName && this.db.interfaces[ifaceName];
+        const md = iv && iv.methods && iv.methods[methodName];
+        const isFireAndForget = !!(md && (md.fireAndForget || md.methodType === 'fireAndForget'));
         try {
             const res = await this.nativeTick(() => px.callMethod(methodName, coercedArgs, timeoutMs || 2800));
             return { ok: true, response: res };
         } catch (e) {
-            return { ok: false, error: e.message };
+            const msg = (e && e.message) ? String(e.message) : String(e || '');
+            const isTimeout = /timeout|timed?\s*out/i.test(msg);
+            if (isFireAndForget && isTimeout) {
+                return { ok: true, response: null, fireAndForget: true };
+            }
+            if (proxyKey !== 'speechPrompter' && proxyKey !== 'voicePrompt' && proxyKey !== 'speechRecognizer') {
+                this.log('ERR call ' + proxyKey + '.' + methodName + ': ' + msg);
+            }
+            return { ok: false, error: msg, timedOut: isTimeout };
         }
     }
 
@@ -477,6 +516,137 @@ class CarController {
     async disconnectAudioRoute(connId) {
         if (!connId || connId <= 0) return;
         await this.callMethodIfAvailable('audioCmd', 'disconnect', { mainConnectionID: connId }, 1500);
+    }
+
+    hasActiveMediaPlayer() {
+        const keys = Object.keys(this._playerStates);
+        for (let i = 0; i < keys.length; i++) {
+            const st = String(this._playerStates[keys[i]] || '').toUpperCase();
+            if (st && st.indexOf('PLAY') >= 0 && st.indexOf('PAUSE') < 0 && st.indexOf('STOP') < 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async getLiveMainSinkInfo() {
+        if (!(await this.isProxyAvailable('audioCmd'))) return null;
+        try {
+            const sinks = await this.callMethodIfAvailable('audioCmd', 'getListMainSinks', {}, 1500);
+            const list = (sinks && sinks.ok && sinks.response && sinks.response.listMainSinks) || [];
+            for (let i = 0; i < list.length; i++) {
+                if (list[i] && Number(list[i].sinkID) === 1 && typeof list[i].volume === 'number') {
+                    const muteRaw = String(list[i].muteState || '').toUpperCase();
+                    const muted = list[i].muteState === 1 || muteRaw === 'MS_MUTED' || muteRaw === 'MUTED';
+                    this.state.media.volumePercent = list[i].volume;
+                    this.state.media.muted = muted;
+                    return { volume: list[i].volume, muted };
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    async getLiveMainVolume() {
+        const info = await this.getLiveMainSinkInfo();
+        return info ? info.volume : null;
+    }
+
+    /**
+     * Smoothly duck loud car music (MainSink sinkID 1 -> volume 6) while ceiling mic listens,
+     * ONLY when speakers are actually audible and NOT muted/paused (calling setVolume on BMW MGU
+     * while paused/muted acts like turning the volume knob and resumes paused music!).
+     */
+    async duckMusicForListening(opts) {
+        const o = opts || {};
+        if (!this.state.liveCar || this.state.callActive || this._duckSavedVol !== null) return false;
+        const sink = await this.getLiveMainSinkInfo();
+        if (!sink || sink.muted || typeof sink.volume !== 'number' || sink.volume <= 10) return false;
+
+        // Guard: NEVER call setVolume when music is paused/silent!
+        const audible = o.hasRefChannel ? !!o.speakerPlaying : this.hasActiveMediaPlayer();
+        if (!audible) {
+            this.log('Audio duck skipped (music paused/silent)');
+            return false;
+        }
+
+        const target = 6;
+        const r = await this.callMethodIfAvailable('audioCmd', 'setVolume', { sinkID: 1, volume: target }, 1200);
+        if (r && r.ok) {
+            this._duckSavedVol = sink.volume;
+            this.log('Audio ducked for mic: ' + sink.volume + ' -> ' + target);
+            return true;
+        }
+        return false;
+    }
+
+    async restoreMusicAfterListening() {
+        if (this._duckSavedVol === null) return false;
+        const orig = this._duckSavedVol;
+        this._duckSavedVol = null;
+        await this.callMethodIfAvailable('audioCmd', 'setVolume', { sinkID: 1, volume: orig }, 1500).catch(() => {});
+        this.state.media.volumePercent = orig;
+        this.log('Audio restored: ' + orig);
+        return true;
+    }
+
+    /**
+     * Play a 24 kHz mono WAV voice confirmation / chime over BMW's native `OapGenericOverlay`
+     * (`sourceID: 1048 -> sinkID: 1024 MediaSink_Front`, Overlay class 2).
+     * Gently ducks CarPlay / Android Auto / Bluetooth music while speaking and restores music cleanly after.
+     */
+    playOverlayWav(wavPath, durationMs) {
+        const task = async () => {
+            if (!wavPath || !fs.existsSync(wavPath) || this.state.callActive) return false;
+            if (!(await this.isProxyAvailable('audioCmd')) || !(await this.isProxyAvailable('mediaOverlay'))) {
+                return false;
+            }
+            let connId = null;
+            let created = false;
+            try {
+                // Connect OapGenericOverlay (1048) -> MediaSink_Front (1024)
+                let connRes = null;
+                for (let i = 0; i < 3; i++) {
+                    if (i > 0) await new Promise((r) => setTimeout(r, 180));
+                    connRes = await this.callMethodIfAvailable('audioCmd', 'connect', {
+                        sourceID: 1048,
+                        sinkID: 1024,
+                    }, 2500);
+                    const amErr = connRes && connRes.response && connRes.response.amError;
+                    if (connRes && connRes.ok && (amErr === 'E_OK' || amErr === 'E_ALREADY_EXISTS' || amErr === 0)) {
+                        connId = connRes.response.mainConnectionID;
+                        created = (amErr === 'E_OK' || amErr === 0);
+                        break;
+                    }
+                }
+                if (connId === null || connId === undefined) return false;
+
+                const pf = await this.callMethodIfAvailable('mediaOverlay', 'playFile', {
+                    path: wavPath,
+                    languageCode: 7695972,
+                }, 3000);
+                if (!pf || !pf.ok || (pf.response && pf.response.EntError && pf.response.EntError !== 'OK' && pf.response.EntError !== 0)) {
+                    return false;
+                }
+                const waitMs = Math.max(250, Math.min(9000, (Number(durationMs) || 2600) + 420));
+                await new Promise((r) => setTimeout(r, waitMs));
+                return true;
+            } catch (e) {
+                this.log('overlay TTS warn: ' + e.message);
+                return false;
+            } finally {
+                await this.callMethodIfAvailable('mediaOverlay', 'sendButtonEvent', {
+                    button: 'STOP',
+                    action: 'PRESS',
+                }, 1500).catch(() => {});
+                if (created && connId !== null && connId !== undefined && connId > 0) {
+                    await this.disconnectAudioRoute(connId).catch(() => {});
+                }
+            }
+        };
+        const p = this._overlayChain.then(task, task);
+        this._overlayChain = p.catch(() => {});
+        return p;
     }
 
     async pulseIpaLight(mode) {
@@ -613,14 +783,29 @@ class CarController {
         }, 'HMISpeechHU');
         addBinding('speechPrompter', 'de.bmw.infotainment.speech.prompter.Prompter', [], ['abortPrompt'], null, 'PALSpeechHU');
         addBinding('voicePrompt', 'de.bmw.infotainment.speech.voiceprompt.VoicePrompt', [], ['abort']);
+        addBinding('speechRecognizer', 'de.bmw.infotainment.speech.recognizer.Recognizer', [], ['abortRecognition'], null, 'PALSpeechHU');
 
         // 3. Phone & CarPlay Call Guard
+        // Each source is tracked separately; callActive = phone || projected (CarPlay / AA).
+        // SOME/IP often delivers the call state as a struct, so never String() it blindly.
+        this.callSrc = this.callSrc || { phone: false, projected: false };
+        const applyCall = (src, active, raw) => {
+            const rawTxt = raw === undefined ? 'undefined' : (function () { try { return JSON.stringify(raw); } catch (e) { return String(raw); } })();
+            const prevRaw = this.state.callRaw && this.state.callRaw[src];
+            this.callSrc[src] = !!active;
+            const next = !!(this.callSrc.phone || this.callSrc.projected);
+            const callRaw = Object.assign({}, this.state.callRaw || {});
+            callRaw[src] = String(rawTxt).slice(0, 160);
+            if (prevRaw !== callRaw[src] && typeof this.log === 'function') this.log('call ' + src + ' -> ' + (active ? 'active' : 'idle') + ' raw=' + callRaw[src]);
+            this.patchState({ callRaw: callRaw });
+            if (next !== this.state.callActive) this.patchState({ callActive: next });
+        };
         addBinding('voiceCall', 'de.bmw.infotainment.connectivity.telephony.VoiceCall', ['state'], [], (f, v) => {
-            const active = !!(v && String(v).toUpperCase().indexOf('IDLE') < 0 && String(v).toUpperCase().indexOf('NONE') < 0 && v !== 0);
-            if (active !== this.state.callActive) this.patchState({ callActive: active });
+            applyCall('phone', isCallStateActive(v), v);
         });
         addBinding('carplay', 'de.bmw.infotainment.a4a.carplay.CarPlayManager', ['projectedTelephonyActive'], [], (f, v) => {
-            if (typeof v === 'boolean' && v !== this.state.callActive) this.patchState({ callActive: v });
+            if (typeof v === 'boolean') applyCall('projected', v, v);
+            else if (v && typeof v === 'object') applyCall('projected', isCallStateActive(v), v);
         });
 
         // 4. Verified SP18 + SP21 OEM BMW IPA Actuators
@@ -670,12 +855,19 @@ class CarController {
         addBinding('windowMaster', 'de.bmw.body.windowmaster.WindowLifterMaster', [], ['moveWindow']);
 
         // 5. Audio Volume (`MainSink` `sinkID: 1`) & Media Transport (`CarPlay` / `Bluetooth` / `AndroidAuto` / `Generic`)
+        const onPlayerState = (key) => (f, v) => {
+            if (f !== 'playerState' || v === null || v === undefined) return;
+            const raw = (v && typeof v === 'object' && v.state !== undefined) ? v.state : v;
+            this._playerStates[key] = String(raw);
+            this.state.media.playing = this.hasActiveMediaPlayer();
+        };
         addBinding('audioCmd', 'org.genivi.am.commandinterface.CommandControl', ['listOfMainConnections'],
             ['connect', 'disconnect', 'getListMainSinks', 'getVolume', 'setVolume', 'setSinkMuteState'], null, '1');
-        addBinding('mediaCarPlay', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], null, 'CarPlayMedia');
-        addBinding('mediaBtA', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], null, 'ExternalDeviceBtA');
-        addBinding('mediaAa', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], null, 'AndroidAutoProjected');
-        addBinding('mediaPlayer', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], null, 'OapGenericMedia');
+        addBinding('mediaCarPlay', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], onPlayerState('mediaCarPlay'), 'CarPlayMedia');
+        addBinding('mediaBtA', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], onPlayerState('mediaBtA'), 'ExternalDeviceBtA');
+        addBinding('mediaAa', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], onPlayerState('mediaAa'), 'AndroidAutoProjected');
+        addBinding('mediaPlayer', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['sendButtonEvent'], onPlayerState('mediaPlayer'), 'OapGenericMedia');
+        addBinding('mediaOverlay', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'], ['playFile', 'sendButtonEvent'], null, 'OapGenericOverlay');
 
         // Single-pass Franca generation
         const mergedProxies = {};
@@ -766,14 +958,7 @@ class CarController {
         await new Promise((r) => setTimeout(r, 1000));
         await this.refreshAvailableProxies(true);
 
-        if (await this.isProxyAvailable('audioCmd')) {
-            try {
-                const volRes = await this.nativeTick(() => this.proxies.audioCmd.callMethod('getVolume', { sinkID: 1 }, 2000));
-                if (volRes && typeof volRes.mainVolume === 'number') {
-                    this.state.media.volumePercent = volRes.mainVolume;
-                }
-            } catch (e) {}
-        }
+        await this.getLiveMainSinkInfo();
 
         this.log('car-control ready (' + this.state.availableProxies.length + ' proxies)');
         this.emitState();
@@ -1106,6 +1291,9 @@ class CarController {
                     comfortPatch.bright = b;
                     args._resolvedBright = b;
                     touched = true;
+                } else if (this.state.ambient && typeof this.state.ambient.brightness === 'number') {
+                    // Preserve active brightness so coerceByDataRef never zeroes it out on color-only changes
+                    sp18Amb.controlBrightnessValueBrightnessOffsetAmbientePanoramicRoofInteriorLighting = Math.max(10, Math.min(100, Math.round(this.state.ambient.brightness)));
                 }
                 const col = args.color ? resolveAmbientColor(args.color) : null;
                 if (col) {
@@ -1125,7 +1313,7 @@ class CarController {
                 const r18 = await this.setFieldIfAvailable('sp18Ambient', 'ambientLightInteriorColour', sp18Amb);
                 if (r18.ok) hwOk = true;
                 const rc = await sendOptionalComfortRgb(this.opts.comfortSock, { op: 'ambient', settings: comfortPatch });
-                if (rc.ok) hwOk = true;
+                if (rc.ok && (!col || col.customRgbOnly || !this.state.liveCar)) hwOk = true;
 
                 if (hwOk) {
                     if (args.on !== undefined) {
@@ -1156,12 +1344,7 @@ class CarController {
                 if (act === 'volume_up' || act === 'volume_down' || args.volumePercent !== undefined) {
                     let targetVol = args.volumePercent;
                     if (targetVol === undefined) {
-                        if (await this.isProxyAvailable('audioCmd')) {
-                            try {
-                                const vr = await this.nativeTick(() => this.proxies.audioCmd.callMethod('getVolume', { sinkID: 1 }, 1500));
-                                if (vr && typeof vr.mainVolume === 'number') this.state.media.volumePercent = vr.mainVolume;
-                            } catch (e) {}
-                        }
+                        await this.getLiveMainSinkInfo();
                         const delta = act === 'volume_up' ? 8 : -8;
                         targetVol = Math.max(0, Math.min(100, this.state.media.volumePercent + delta));
                     } else {
@@ -1270,23 +1453,29 @@ class CarController {
                         : (target === 'rear') ? ['rl', 'rr']
                             : ['fl', 'fr', 'rl', 'rr'];
 
+                // On BMW G30 SP18, `WindowLifter.moveWindow` executes on BDC immediately while the reply
+                // either times out after full glass travel OR throws `windowPosition: Enum value N not found`
+                // because BMW's `someip-interfaces.json` mistakenly defines output `windowPosition` as an enum
+                // with only `WINDOW_POSITION: 100` while BDC returns the actual % (0..99). Treat both as OK!
+                const winOk = (res) => !!(res && (res.ok || res.timedOut || /Enum value \d+ not found/i.test(String(res.error || ''))));
+                let sp18AllSent = false;
                 if (keys.length === 4) {
-                    const rAll = await this.callMethodIfAvailable('windowLifter', 'moveWindow', { windowId: 'ALL_WINDOWS', windowControl: pct });
-                    if (rAll.ok) anyOk = true;
+                    const rAll = await this.callMethodIfAvailable('windowLifter', 'moveWindow', { windowId: 'ALL_WINDOWS', windowControl: pct }, 5500);
+                    if (winOk(rAll)) { anyOk = true; sp18AllSent = true; }
                 }
                 for (let i = 0; i < keys.length; i++) {
                     const k = keys[i];
-                    if (!anyOk) {
-                        const r18 = await this.callMethodIfAvailable('windowLifter', 'moveWindow', { windowId: WINDOW_ID_SP18[k], windowControl: pct });
-                        if (r18.ok) anyOk = true;
+                    if (!sp18AllSent) {
+                        const r18 = await this.callMethodIfAvailable('windowLifter', 'moveWindow', { windowId: WINDOW_ID_SP18[k], windowControl: pct }, 5500);
+                        if (winOk(r18)) anyOk = true;
                     }
                     const r21 = await this.callMethodIfAvailable('windowMaster', 'moveWindow', {
                         priorityGroup: 6,
                         consumerId: 16,
                         windowControl: { windowId: WINDOW_ID_SP21[k], windowPosition: pct },
                         windowKeySearch: 0,
-                    });
-                    if (r21.ok) anyOk = true;
+                    }, 5500);
+                    if (winOk(r21)) anyOk = true;
                 }
                 if (anyOk) {
                     for (let j = 0; j < keys.length; j++) this.state.windows[keys[j]] = pct;
@@ -1331,6 +1520,7 @@ class CarController {
 }
 
 module.exports = {
+    isCallStateActive,
     OEM_AMBIENT_COLORS,
     resolveAmbientColor,
     coerceByDataRef,

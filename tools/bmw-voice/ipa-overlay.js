@@ -46,8 +46,9 @@ const OP = {
     GLYPHS: 11,
 };
 
-// iDrive 7 content area right of Back/Home column (`x: 84..1920`) and below Status bar (`y: 76..720`)
-const OVERLAY_BOX = { x: 84, y: 76, w: 1836, h: 644 };
+// Full-screen BMW iDrive 7 display (`1920x720`) edge-to-edge so OEM BMW IPA overlay covers
+// the entire screen cleanly (including top bar & left rail) with zero gaps around BMW's native UI
+const OVERLAY_BOX = { x: 0, y: 0, w: 1920, h: 720 };
 
 function packRgba(r, g, b, a) {
     const alpha = a === undefined ? 255 : Math.max(0, Math.min(255, Math.round(a * 255)));
@@ -483,6 +484,7 @@ class IpaOverlay {
             if (type === E.READY) {
                 this.ready = true;
                 this._sendPlace();
+                this._prewarmFonts();
                 if (this.phase !== 'hidden') {
                     this._renderAndSend(true);
                 }
@@ -490,6 +492,23 @@ class IpaOverlay {
                 this.onLog('ipa-overlay renderer warn: ' + payload.toString('utf8'));
             }
         }
+    }
+
+    _prewarmFonts() {
+        // Pre-inflate Vietnamese font atlases and upload them to GPU VRAM on connect
+        // so the very first PTT press renders in <2ms without zlib inflate lag.
+        try {
+            const used = [];
+            [17, 34].forEach((sz) => {
+                const f = this.fontBank.getFont(true, sz);
+                if (f && used.indexOf(f) < 0) used.push(f);
+            });
+            [16, 22].forEach((sz) => {
+                const f = this.fontBank.getFont(false, sz);
+                if (f && used.indexOf(f) < 0) used.push(f);
+            });
+            if (used.length) this._ensureAtlases(used);
+        } catch (e) {}
     }
 
     _sendPlace(overrideW) {
@@ -550,15 +569,14 @@ class IpaOverlay {
 
     _scheduleTopReassertions() {
         while (this.reassertTimers.length) clearTimeout(this.reassertTimers.pop());
-        // Recreate & re-show the Wayland IVI layer across +80ms..+1050ms so HmiMain3D's
-        // "Không khả dụng" system scene change can never bury our BMW IPA overlay regardless of timing.
-        [80, 200, 380, 650, 1050].forEach((delayMs, idx) => {
+        // NEVER send M.SHOW(0) or M.PLACE(w-1) while active: destroying/hiding the Wayland surface
+        // flashes HmiMain3D's underlying "Không khả dụng" screen right through! Instead, simply
+        // re-send M.SHOW(1) cleanly so mgu-render keeps our layer pinned on top with zero flicker.
+        [120, 320, 680].forEach((delayMs) => {
             const t = setTimeout(() => {
                 if (this.phase === 'hidden' || !this.ready || !this.placed) return;
-                this._write(u32Msg(M.SHOW, [0]));
-                this.visible = false;
-                this._sendPlace((idx & 1) === 0 ? (this.box.w - 1) : this.box.w);
-                this._renderAndSend(true);
+                this._write(u32Msg(M.SHOW, [1]));
+                this.visible = true;
             }, delayMs);
             if (t.unref) t.unref();
             this.reassertTimers.push(t);
@@ -628,6 +646,20 @@ class IpaOverlay {
         if (this.hideTimer.unref) this.hideTimer.unref();
     }
 
+    extendHide(extraMs) {
+        if (this.phase !== 'result') return;
+        if (this.hideTimer) {
+            clearTimeout(this.hideTimer);
+            this.hideTimer = null;
+        }
+        const duration = Math.max(1800, Math.min(9500, Number(extraMs) || 3600));
+        this.hideTimer = setTimeout(() => {
+            this.hideTimer = null;
+            this.hide();
+        }, duration);
+        if (this.hideTimer.unref) this.hideTimer.unref();
+    }
+
     hide() {
         this._clearTimers();
         this.phase = 'hidden';
@@ -654,8 +686,8 @@ class IpaOverlay {
         // Top BMW Intelligent Personal Assistant luminous accent bar
         d.rect(0, 0, W, 3, hexColor(accentHex, 0.92));
 
-        // Central sleek OEM BMW IPA Dialog Card
-        const cardW = 1480, cardH = 380;
+        // Central sleek OEM BMW IPA Dialog Card (centered on full 1920x720 display)
+        const cardW = Math.min(1560, W - 160), cardH = 400;
         const cardX = Math.round((W - cardW) / 2);
         const cardY = Math.round((H - cardH) / 2);
 

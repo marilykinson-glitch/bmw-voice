@@ -96,6 +96,11 @@
       <span>Gọi rảnh tay <b>"Hey BMW"</b> mọi lúc (nói <i>"Hey BMW + câu lệnh"</i> hoặc nói <i>"Hey BMW"</i> để bật giao diện trợ lý)</span>
     </label>
 
+    <label class="toggle-row" for="voiceReply">
+      <input type="checkbox" id="voiceReply" checked>
+      <span>Phản hồi bằng <b>giọng nói tiếng Việt</b> qua loa xe (kênh Overlay BMW, tự giảm nhẹ nhạc nền)</span>
+    </label>
+
     <label>Cách gọi trên nút Mic vô-lăng:</label>
     <select id="pttTrigger">
       <option value="short_press">Bấm nút Mic vô-lăng (hiện giao diện trợ lý chuẩn BMW)</option>
@@ -129,6 +134,7 @@
   var PIN = (new URLSearchParams(location.search)).get('pin') || '';
   var dirtyToggle = false;
   document.getElementById('handsFreeWake').addEventListener('change', function() { dirtyToggle = true; });
+  document.getElementById('voiceReply').addEventListener('change', function() { dirtyToggle = true; });
 
   function api(path, method, body) {
     var sep = path.indexOf('?') >= 0 ? '&' : '?';
@@ -142,7 +148,16 @@
   function render(s) {
     if (!s) return;
     var kb = document.getElementById('keyBadge');
-    if (s.settings && s.settings.hasApiKey) {
+    var off = s.offline || {};
+    var hasOff = !!(off.stt || off.kws);
+    if (hasOff) {
+      var parts = [];
+      if (off.kws) parts.push('KWS');
+      if (off.stt) parts.push('STT');
+      if (off.tts) parts.push('TTS');
+      kb.textContent = '🟢 Offline Tiếng Việt (' + parts.join('+') + ')' + (s.settings && s.settings.hasApiKey ? ' · +Gemini' : '');
+      kb.className = 'badge ok';
+    } else if (s.settings && s.settings.hasApiKey) {
       kb.textContent = (s.wakeStatus === 'armed' ? '🟢 Hey BMW Sẵn sàng · ' : 'Đã cài Key · ') + s.settings.apiKeyMasked;
       kb.className = 'badge ok';
     } else {
@@ -154,6 +169,9 @@
     }
     if (!dirtyToggle && s.settings && typeof s.settings.handsFreeWake === 'boolean') {
       document.getElementById('handsFreeWake').checked = s.settings.handsFreeWake;
+    }
+    if (!dirtyToggle && s.settings && typeof s.settings.voiceReply === 'boolean') {
+      document.getElementById('voiceReply').checked = s.settings.voiceReply;
     }
     var car = s.car || {};
     var aud = s.audio || {};
@@ -169,7 +187,8 @@
   function saveSettings() {
     var body = {
       pttTrigger: document.getElementById('pttTrigger').value,
-      handsFreeWake: !!document.getElementById('handsFreeWake').checked
+      handsFreeWake: !!document.getElementById('handsFreeWake').checked,
+      voiceReply: !!document.getElementById('voiceReply').checked
     };
     var k = document.getElementById('apiKey').value.trim();
     if (k) body.apiKey = k;

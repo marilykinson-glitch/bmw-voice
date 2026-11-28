@@ -73,7 +73,12 @@ mgu.run({
         }
 
         function reclaimHmiScreen() {
-            if (ctx.openApp) ctx.openApp({ force: true });
+            // Only reopen MAIN via openState if MAIN is already in our HMI stack; calling openEntryState
+            // unsolicited from background is rejected by HmiMain3D with RemoteError: INVALID_UUID.
+            // System-wide PTT & Hey BMW visual coverage is handled cleanly by uid=0 IpaOverlay!
+            if (ui.isRootInFront && ui.isRootInFront() && isMainVisible()) {
+                if (ui.open) ui.open('MAIN');
+            }
         }
 
         function scheduleReclaimWaves() {
@@ -476,6 +481,6 @@ mgu.run({
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.2.0 ready');
+        log.info('bmw_voice v1.2.1 ready');
     },
 });
