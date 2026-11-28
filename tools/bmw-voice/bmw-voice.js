@@ -31,7 +31,7 @@ const NluBrain = require('./nlu-brain');
 const OfflineAi = require('./offline-ai');
 const { IpaOverlay } = require('./ipa-overlay');
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const FW_TAG = 'bmw-voice';
 const APP_RE = /^bmw_voice\d*$/;
 
@@ -340,7 +340,8 @@ class BmwVoiceDaemon {
                 const rawPhrase = phrases[idx++];
                 const text = NluBrain.formatOfflineSpeechTextVi(rawPhrase);
                 if (!text) continue;
-                const hash = crypto.createHash('sha1').update('v4:piper:' + text).digest('hex').slice(0, 16);
+                // Same key and pause compression as speakReply(), so prewarmed phrases are actually reused.
+                const hash = crypto.createHash('sha1').update('v5:piper:' + text).digest('hex').slice(0, 16);
                 const file = path.join(cacheDir, hash + '.wav');
                 if (fs.existsSync(file)) continue;
                 if (this.turnBusy || this.assistantState !== 'idle' || this.car.state.speedKmh > 2) {
@@ -351,7 +352,7 @@ class BmwVoiceDaemon {
                 }
                 this.offlineWorker.synthesize({ text, timeoutMs: 22000 }).then((tts) => {
                     if (tts && tts.wavBuffer) {
-                        try { writeAtomic(file, tts.wavBuffer, 0o644); } catch (e) {}
+                        try { writeAtomic(file, this.compressPauses(tts.wavBuffer), 0o644); } catch (e) {}
                     }
                     this.prewarmTimer = setTimeout(step, 6000);
                     if (this.prewarmTimer.unref) this.prewarmTimer.unref();

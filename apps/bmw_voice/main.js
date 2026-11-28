@@ -481,6 +481,6 @@ mgu.run({
         ui.onClick('BTN_QR', acts.toggleQr);
 
         await render();
-        log.info('bmw_voice v1.2.1 ready');
+        log.info('bmw_voice v1.2.2 ready');
     },
 });

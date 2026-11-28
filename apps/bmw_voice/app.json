@@ -2,7 +2,7 @@
   "id": "bmw_voice",
   "title": "Trợ lý BMW",
   "description": "Thay thế Trợ lý Giọng nói nguyên bản BMW Intelligent Personal Assistant trên MGU iDrive 7: gọi rảnh tay \"Hey BMW\" hoặc bấm nút Mic vô-lăng hiện ngay giao diện trợ lý chuẩn BMW trên mọi màn hình để điều khiển xe bằng Tiếng Việt.",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "vendor": "custom",
   "loggingId": "OABV",
   "startType": "autostart",

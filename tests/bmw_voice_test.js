@@ -37,10 +37,10 @@ async function runTests() {
         console.log('  [PASS] ' + name);
     });
 
-    console.log('Running bmw-voice v1.2.1 test suite...');
+    console.log('Running bmw-voice v1.2.2 test suite...');
 
     // 1. MGU Boot Safety, Systemd, Bundled Vietnamese Fonts & Read-Only ALSA Capture Invariants
-    await step('Systemd service, component.json v1.2.1, bundled Inter fonts & ALSA capture-only invariants', () => {
+    await step('Systemd service, component.json v1.2.2, bundled Inter fonts & ALSA capture-only invariants', () => {
         const root = path.resolve(__dirname, '..');
         const svc = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'bmw-voice.service'), 'utf8');
         assert.ok(svc.indexOf('WantedBy=oapcontroller.service') >= 0);
@@ -50,7 +50,7 @@ async function runTests() {
 
         const comp = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'component.json'), 'utf8'));
         assert.strictEqual(comp.id, 'bmw-voice');
-        assert.strictEqual(comp.version, '1.2.1');
+        assert.strictEqual(comp.version, '1.2.2');
         assert.strictEqual(comp.enable[0].target, 'oapcontroller.service');
         assert.deepStrictEqual(comp.recmgr, ['bmw-voice']);
 
@@ -59,11 +59,11 @@ async function runTests() {
         });
 
         const appSpec = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'bmw_voice', 'app.json'), 'utf8'));
-        assert.strictEqual(appSpec.version, '1.2.1');
+        assert.strictEqual(appSpec.version, '1.2.2');
         assert.strictEqual(appSpec.startType, 'autostart');
 
         const repoSpec = JSON.parse(fs.readFileSync(path.join(root, 'mgu-repo.json'), 'utf8'));
-        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.2.1');
+        assert.strictEqual(repoSpec.components[0].requires['bmw-voice'], '1.2.2');
 
         const py = fs.readFileSync(path.join(root, 'tools', 'bmw-voice', 'alsa-smartx.py'), 'utf8');
         assert.strictEqual(py.indexOf('SND_PCM_STREAM_PLAYBACK'), -1);
@@ -917,7 +917,7 @@ async function runTests() {
         assert.ok(outMs >= 225 && outMs <= 240, 'inner 80 ms gap shortened to ~30 ms (total ' + outMs + ' ms)');
     });
 
-    console.log('\nALL ' + passed + ' BMW-VOICE v1.2.1 TEST SUITES PASSED!');
+    console.log('\nALL ' + passed + ' BMW-VOICE v1.2.2 TEST SUITES PASSED!');
 }
 
 runTests().catch((err) => {
